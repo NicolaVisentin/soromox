@@ -193,6 +193,23 @@ class DynamicalSystem(eqx.Module):
 
         if solver is None:
             solver = Tsit5()
+            
+        ####### START MY OLD
+        # y0 = jnp.concatenate([q0, qd0])  # Initial state vector
+        # if u is None:
+        #     u = jnp.zeros((self.num_actuators,))
+        # if tau_ext is None:
+        #     tau_ext = jnp.zeros((q0.shape[-1],))
+        # if saveat_ts is None:
+        #     assert save_dt is not None, "Either saveat_ts or save_dt must be provided."
+        #     assert save_dt > 0.0, "save_dt must be positive."
+        #     assert save_dt >= dt, "save_dt must be greater than or equal to the simulation dt."
+        #     num_steps = int(round((t1 - t0) / save_dt)) + 1
+        #     saveat_ts = jnp.linspace(t0, t1, num_steps) # use linspace and not arange for numerical reasons
+
+        # term = ODETerm(self.forward_dynamics)
+        # saveat = SaveAt(ts=saveat_ts)  # Save at specified time points
+        ####### END MY OLD
 
         sol = diffeqsolve(
             terms=term,
