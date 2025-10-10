@@ -25,9 +25,10 @@ params = {
 q0 = jnp.array([-jnp.pi * 7/11, jnp.pi * 7/13])
 
 # set simulation parameters
-dt = 1e-3  # time step
-ts = jnp.arange(0.0, 15, dt)  # time steps
-skip_step = 100  # how many time steps to skip in between video frames
+dt = 1e-3        # time step
+t0 = 0.0
+t1 = 15.0
+save_dt = 100*dt # time resolution for saving results
 
 
 if __name__ == "__main__":
@@ -44,11 +45,12 @@ if __name__ == "__main__":
         q0=q0,
         qd0=qd0,
         u=u,
-        t0=ts[0],
-        t1=ts[-1],
+        t0=t0,
+        t1=t1,
         dt=dt,
-        skip_steps=skip_step,
+        save_dt=save_dt,
     )
+    
 
     # =====================================================
     # End-effector position upon time
@@ -94,10 +96,10 @@ if __name__ == "__main__":
             q0=q0,
             qd0=qd0,
             u=u,
-            t0=ts[0],
-            t1=ts[-1],
+            t0=t0,
+            t1=t1,
             dt=dt,
-            skip_steps=skip_step,
+            save_dt=save_dt,
             max_steps=int(1e5)
         )
         ee_final = robot_updated.forward_kinematics_tips(q_ts[-1,:])[-1, 1:]
@@ -127,12 +129,13 @@ if __name__ == "__main__":
     print('Starting optimization...')
     loss_and_grad = jax.value_and_grad(Loss)
     for i in range(50):
+        L_softplus_iter = L_softplus
+        L_iter = jax.nn.softplus(L_softplus)
         loss, grads = loss_and_grad(L_softplus)
         updates, opt_state = optimizer.update(grads, opt_state, L_softplus)
         L_softplus = optax.apply_updates(L_softplus, updates)
 
-        L_iter = jax.nn.softplus(L_softplus)
-        print(f"Iter {i:02d} | loss={loss:.3e}| grads={grads} | L1={L_iter[0]:.3f} | L2={L_iter[1]:.3f} | L1_softplus={L_softplus[0]:.3f} | L2_softplus={L_softplus[1]:.3f}")
+        print(f"Iter {i:02d} | loss={loss:.3e}| grads={grads} | L1={L_iter[0]:.3f} | L2={L_iter[1]:.3f} | L1_softplus={L_softplus_iter[0]:.3f} | L2_softplus={L_softplus_iter[1]:.3f}")
 
     L_opt = jax.nn.softplus(L_softplus)
     print("Optimal lengths:", L_opt)
@@ -142,10 +145,10 @@ if __name__ == "__main__":
             q0=q0,
             qd0=qd0,
             u=u,
-            t0=ts[0],
-            t1=ts[-1],
+            t0=t0,
+            t1=t1,
             dt=dt,
-            skip_steps=skip_step,
+            save_dt=save_dt,
             max_steps=int(1e5)
         )
     ee_final = robot.forward_kinematics_tips(q_ts[-1,:])[-1, 1:]
