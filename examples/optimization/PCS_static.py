@@ -182,7 +182,7 @@ u = jnp.zeros_like(q0)
 t0 = 0.0
 t1 = 5
 dt = 1e-3
-skip_step = 100
+save_dt = 100*dt
 solver = Tsit5()
 max_steps = int(1e6)
 
@@ -194,7 +194,7 @@ ts, q_ts, _ = robot.resolve_upon_time(
     t0 = t0, 
     t1 = t1, 
     dt = dt, 
-    skip_steps = skip_step, 
+    save_dt = save_dt, 
     solver = solver,
     max_steps = max_steps
 )
@@ -282,7 +282,7 @@ def Loss(L_softplus):
         t0 = t0, 
         t1 = t1, 
         dt = dt, 
-        skip_steps = skip_step, 
+        save_dt = save_dt, 
         solver = solver,
         max_steps = max_steps
     )                                              # simulate
@@ -311,13 +311,15 @@ loss_and_grad = jax.jit(jax.value_and_grad(Loss))
 loss_ts = []
 n_iter = 10
 for i in range(n_iter):
+    L_softplus_print = L_softplus
+    L_print = jax.nn.softplus(L_softplus)
     loss, grads = loss_and_grad(L_softplus)
     updates, opt_state = optimizer.update(grads, opt_state, L_softplus)
     L_softplus = optax.apply_updates(L_softplus, updates)
 
     loss_ts.append(loss)
     if i % 1 == 0:
-        print(f"Iter {i:02d} | loss={loss:.3e} | L_softplus={L_softplus} | L={jax.nn.softplus(L_softplus)} | grads={grads}")
+        print(f"Iter {i:02d} | loss={loss:.3e} | L_softplus={L_softplus_print} | L={L_print} | grads={grads}")
 
 L_opt = jax.nn.softplus(L_softplus)
 print("Optimal lengths:", L_opt)
@@ -348,7 +350,7 @@ ts, q_ts, qd_ts = robot_opt.resolve_upon_time(
     t0=t0,
     t1=t1,
     dt=dt,
-    skip_steps=skip_step,
+    save_dt=save_dt,
     solver=solver,
     max_steps=None,
 )
