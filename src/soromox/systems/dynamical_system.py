@@ -75,8 +75,9 @@ class DynamicalSystem(eqx.Module):
             assert save_dt is not None, "Either saveat_ts or save_dt must be provided."
             assert save_dt > 0.0, "save_dt must be positive."
             assert save_dt >= dt, "save_dt must be greater than or equal to the simulation dt."
-            num_steps = int(round((t1 - t0) / save_dt)) + 1
-            saveat_ts = jnp.linspace(t0, t1, num_steps) # use linspace and not arange for numerical reasons
+            saveat_ts = jnp.arange(t0, t1 + save_dt, save_dt)
+            #num_steps = int(round((t1 - t0) / save_dt)) + 1
+            #saveat_ts = jnp.linspace(t0, t1, num_steps) # use linspace and not arange for numerical reasons
 
         term = ODETerm(self.forward_dynamics)
         saveat = SaveAt(ts=saveat_ts)  # Save at specified time points

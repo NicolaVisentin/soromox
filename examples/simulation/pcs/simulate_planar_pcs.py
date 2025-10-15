@@ -1,3 +1,7 @@
+# Choose device (cpu or gpu)
+import os
+os.environ["JAX_PLATFORM_NAME"] = "cpu"
+
 from diffrax import Tsit5
 from functools import partial
 from IPython.display import HTML
@@ -141,7 +145,7 @@ def animate_robot_matplotlib(
 
 
 if __name__ == "__main__":
-    num_segments = 1
+    num_segments = 2
     rho = 1070 * jnp.ones(
         (num_segments,)
     )  # Volumetric density of Dragon Skin 20 [kg/m^3]
@@ -190,7 +194,7 @@ if __name__ == "__main__":
 
     # Simulation time parameters
     t0 = 0.0
-    t1 = 2.0
+    t1 = 10.0
     dt = 1e-4
     save_dt = 0.01
 
