@@ -1,3 +1,8 @@
+# Choose device (cpu or gpu)
+import os
+os.environ["JAX_PLATFORM_NAME"] = "cpu"
+
+from diffrax import Tsit5
 from functools import partial
 
 import jax
@@ -17,7 +22,7 @@ jnp.set_printoptions(
 
 
 if __name__ == "__main__":
-    num_segments = 1
+    num_segments = 2
     rho = 1070 * jnp.ones(
         (num_segments,)
     )  # Volumetric density of Dragon Skin 20 [kg/m^3]
