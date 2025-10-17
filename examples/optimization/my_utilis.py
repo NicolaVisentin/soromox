@@ -6,6 +6,7 @@ import numpy as onp
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D # noqa: F401
 import time
+import pickle
 
 
 # Inverse softplus
@@ -23,7 +24,8 @@ def PlotLoss(Loss,
              N1=25,
              N2=25,
              chunk_size=None,
-             min_softplus=None
+             min_softplus=None,
+             savepath=None
 ):
     """
     Plots 3D surface the loss as a function of the parameters. Works for 2 parameters.
@@ -44,6 +46,10 @@ def PlotLoss(Loss,
         (Just for rescaling the axes) Not None if the parameters are re-parametrized with softplus in 
         the loss. This argument should be a tuple (par1_min, par2_min) equal to the minimum threshold 
         for each parameter (set (0,0) if a pure softplus was used).
+      savepath:
+        path where saving the plots. Must be in form .../savefolder/'name_figure'. Saves all plots as png 
+        and also 3D surface plot as binary file that can be re-loaded in python. If None, plots are not
+        saved.
 
     Return:
       Z:
@@ -138,6 +144,8 @@ def PlotLoss(Loss,
         plt.ylim([onp.min(Y), onp.max(Y)])
         plt.legend()
         plt.title(f'Detected {N_nan}/{n_points} NaN and {N_inf}/{n_points} Inf')
+        if savepath is not None:
+          plt.savefig(f'{savepath}_nanlocations', bbox_inches='tight')
         
     # 3D plotting
     z_lower = onp.min(Z[onp.isfinite(Z) & (Z>-1e10)])
@@ -154,6 +162,10 @@ def PlotLoss(Loss,
     ax.set_zlim([z_lower, z_upper])
     ax.set_title('Loss function surface plot')
     fig.colorbar(surf, ax=ax, shrink=0.6, aspect=12)
+    if savepath is not None:
+      plt.savefig(savepath, bbox_inches='tight')
+      with open(savepath, 'wb') as f:
+          pickle.dump(plt.gcf(), f)
     plt.show()
 
     return Z, onp.array(param_nan), onp.array(param_inf)
