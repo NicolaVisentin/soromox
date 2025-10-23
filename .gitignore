@@ -12,6 +12,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Custom
+examples/optimization/plots and videos
+examples/optimization/saved data
+
 # C extensions
 *.so
 
