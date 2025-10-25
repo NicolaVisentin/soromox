@@ -6,7 +6,7 @@
 import os
 os.environ["JAX_PLATFORM_NAME"] = "cpu"
 
-# Imports and setup
+# Imports
 import numpy as onp
 import jax
 import jax.numpy as jnp
@@ -14,23 +14,35 @@ from jax import Array
 import optax
 from diffrax import Tsit5, Euler, Heun, Midpoint, Ralston, Bosh3, Dopri5, Dopri8, ImplicitEuler, Kvaerno3
 from diffrax import ConstantStepSize, PIDController
+
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from matplotlib.widgets import Slider
 from matplotlib.ticker import MaxNLocator
+
 from pathlib import Path
 from tqdm import tqdm
 import time
+
 from soromox.systems.planar_pcs import PlanarPCS
 from soromox.utils.lie_algebra.se2 import exp_SE2
-from my_utilis import InverseSoftplus, PlotLoss
+from my_utilis import *
 
+# Jax settings
 jax.config.update("jax_enable_x64", True)  # double precision
 jnp.set_printoptions(
     threshold=jnp.inf,
     linewidth=jnp.inf,
     formatter={"float_kind": lambda x: "0" if x == 0 else f"{x:.2e}"},
 )
+
+# Folders
+curr_folder = Path(__file__).parent
+plots_folder = curr_folder/'plots and videos'/Path(__file__).stem
+plots_folder.mkdir(parents=True, exist_ok=True)
+
+data_folder = curr_folder/'saved data'/Path(__file__).stem
+data_folder.mkdir(parents=True, exist_ok=True)
 
 # Functions for plotting
 def draw_robot(
@@ -158,135 +170,6 @@ def animate_robot_matplotlib(
             plt.show()
 
         plt.close(fig)
-
-def plot_optimiz_evolution(ts, solutions1_ts, solutions2_ts, targets, show=True, save=False, savepath=None):
-    """
-    Args:
-        ts:
-            Time vector. Shape (N_timeinstants)
-        solutions1_ts, solutions2_ts:
-            Shape (N_iterations, N_timeinstants)
-        targets:
-            Shape (2, N_timeistants,)
-        show:
-            Boolean.
-        save:
-            Boolean.
-        savepath:
-            Path where saving animation, in form: folder/'title_animation.gif'
-    """
-    # create slider animation   
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
-    plt.subplots_adjust(bottom=0.15)
-    
-    ax_slider = fig.add_axes([0.2, 0.01, 0.6, 0.03])  # [left, bottom, width, height]
-
-    def update_plot(frame_idx):
-        ax1.cla()  # clear current axes
-        ax1.plot(ts, solutions1_ts[frame_idx, :], color='r', label=r'$x_{1}^{locA}(t)$')
-        ax1.plot(ts, targets[0, :], color='r', linestyle='--', label='target')
-        ax1.set_xlim(ts[0], ts[-1])
-        ax1.set_ylim(onp.min([solutions1_ts.min(), targets[0, :].min()]), onp.max([solutions1_ts.max(), targets[0, :].max()]))
-        ax1.set_xlabel("t [s]")
-        ax1.set_ylabel(r"$x^{locA}$ [m]")
-        ax1.set_title(f"Optimization point 1 (iteration n. {frame_idx})")
-        ax1.grid(True)
-        ax1.legend()
-
-        ax2.cla()  # clear current axes
-        ax2.plot(ts, solutions2_ts[frame_idx, :], color='r', label=r'$y_{2}^{locB}(t)$')
-        ax2.plot(ts, targets[1, :], color='r', linestyle='--', label='target')
-        ax2.set_xlim(ts[0], ts[-1])
-        ax2.set_ylim(onp.min([solutions2_ts.min(), targets[1, :].min()]), onp.max([solutions2_ts.max(), targets[1, :].max()]))
-        ax2.set_xlabel("t [s]")
-        ax2.set_ylabel(r"$y^{locB}$ [m]")
-        ax2.set_title(f"Optimization point 2 (iteration n. {frame_idx})")
-        ax2.grid(True)
-        ax2.legend()
-
-        fig.canvas.draw_idle()
-
-    slider = Slider(
-        ax=ax_slider,
-        label="Iter.",
-        valmin=0,
-        valmax=len(solutions1_ts) - 1,
-        valinit=0,
-        valstep=1,
-    )
-    slider.on_changed(update_plot)
-
-    update_plot(0)  # initial plot
-
-    if show:
-        plt.show()
-
-    plt.close(fig)
-    
-    # create animation to be saved
-    if save and savepath is None:
-        print('Optimization animation not saved: must provide a path where the animation can be saved.')
-
-    elif save and savepath is not None:        
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
-
-        (line_sim1,) = ax1.plot([], [], color="r", label=r'$x_{1}^{locA}(t)$')
-        (line_tar1,) = ax1.plot([], [], color="r", linestyle='--', label='target')
-        ax1.set_xlim(ts[0], ts[-1])
-        ax1.set_ylim(onp.min([solutions1_ts.min(), targets[0, :].min()]), onp.max([solutions1_ts.max(), targets[0, :].max()]))
-        ax1.set_xlabel("t [s]")
-        ax1.set_ylabel(r"$x^{locA}$ [m]")
-        title_text1 = ax1.set_title(f"Optimization point 1 (iteration n. 0)")
-        ax1.grid(True)
-        ax1.legend()
-
-        (line_sim2,) = ax2.plot([], [], color="r", label=r'$y_{2}^{locB}(t)$')
-        (line_tar2,) = ax2.plot([], [], color="r", linestyle='--', label='target')
-        ax2.set_xlim(ts[0], ts[-1])
-        ax2.set_ylim(onp.min([solutions2_ts.min(), targets[1, :].min()]), onp.max([solutions2_ts.max(), targets[1, :].max()]))
-        ax2.set_xlabel("t [s]")
-        ax2.set_ylabel(r'$y^{locB}$ [m]')
-        title_text2 = ax2.set_title(f"Optimization point 2 (iteration n. 0)")
-        ax2.grid(True)
-        ax2.legend()
-
-        fig.tight_layout()
-
-        def init():
-            line_sim1.set_data([], [])
-            line_tar1.set_data(ts, targets[0,:])
-            title_text1.set_text(f"Optimization point 1 (iteration n. 0)")
-            line_sim2.set_data([], [])
-            line_tar2.set_data(ts, targets[1,:])
-            title_text2.set_text(f"Optimization point 2 (iteration n. 0)")
-            return line_sim1, line_tar1, title_text1, line_sim2, line_tar2, title_text2
-
-        def update(frame_idx):
-            line_sim1.set_data(ts, solutions1_ts[frame_idx, :])
-            title_text1.set_text(f"Optimization point 1 (iteration n. {frame_idx})")
-            line_sim2.set_data(ts, solutions2_ts[frame_idx, :])
-            title_text2.set_text(f"Optimization point 2 (iteration n. {frame_idx})")
-            return (line_sim1, line_tar1, title_text1, line_sim2, line_tar2, title_text2)
-        
-        ani = FuncAnimation(
-            fig,
-            update,
-            frames=len(solutions1_ts),
-            init_func=init,
-            blit=True
-        )
-
-        ani.save(savepath, writer="pillow", fps=len(solutions1_ts)/10)
-        plt.close(fig)
-
-# Folder for plots and videos
-curr_folder = Path(__file__).parent
-plots_folder = curr_folder/'plots and videos'/Path(__file__).stem
-plots_folder.mkdir(parents=True, exist_ok=True)
-
-# Folder for saving data
-data_folder = curr_folder/'saved data'/Path(__file__).stem
-data_folder.mkdir(parents=True, exist_ok=True)
 
 
 # =====================================================
@@ -436,7 +319,6 @@ animate_robot_matplotlib(
     animation = False,
     show = True
 )
-exit()
 
 
 # =====================================================
@@ -620,11 +502,9 @@ plt.savefig(plots_folder/'Loss1')
 
 plot_optimiz_evolution(
     ts=ts,
-    solutions1_ts=solutions1_ts,
-    solutions2_ts=solutions2_ts,
+    solutions=onp.stack((solutions1_ts, solutions2_ts), axis=0),
     targets=targets,
     show=True,
-    save=True,
     savepath=plots_folder/'optimization1_animation.gif'
 )
 exit()

@@ -30,7 +30,7 @@ import select
 from soromox.systems.planar_pcs import PlanarPCS
 from soromox.systems.planar_pcs_simplified import PlanarPCS_simple
 from soromox.utils.lie_algebra.se2 import exp_SE2
-from my_utilis import PlotLoss, InverseSoftplus
+from my_utilis import *
 
 jax.config.update("jax_enable_x64", True)  # double precision
 jnp.set_printoptions(
@@ -38,6 +38,15 @@ jnp.set_printoptions(
     linewidth=jnp.inf,
     formatter={"float_kind": lambda x: "0" if x == 0 else f"{x:.2e}"},
 )
+
+# Folder for plots and videos
+curr_folder = Path(__file__).parent
+plots_folder = curr_folder/'plots and videos'/Path(__file__).stem
+plots_folder.mkdir(parents=True, exist_ok=True)
+
+# Folder for saving data
+data_folder = curr_folder/'saved data'/Path(__file__).stem
+data_folder.mkdir(parents=True, exist_ok=True)
 
 # Functions for plotting
 def draw_robot(robot: PlanarPCS | PlanarPCS_simple, q: Array, num_points: int = 50):
@@ -166,109 +175,6 @@ def animate_robot_matplotlib(
             plt.show()
 
         plt.close(fig)
-
-def plot_optimiz_evolution(ts, solutions_ts, target, show=True, save=False, savepath=None):
-    """
-    Args:
-        ts:
-            Time vector. Shape (N_timeinstants)
-        solutions_ts:
-            Shape (N_iterations, N_timeinstants)
-        target:
-            Shape (N_timeistants,)
-        show:
-            Boolean.
-        save:
-            Boolean.
-        savepath:
-            Path where saving animation, in form: folder/'title_animation.gif'
-    """
-    # Limits for the y axis
-    y_lower = onp.min([solutions_ts[onp.isfinite(solutions_ts) & (solutions_ts>-1e6)].min(), target.min()])
-    y_upper = onp.max([solutions_ts[onp.isfinite(solutions_ts) & (solutions_ts<1e6)].max(), target.max()])
-
-    # Create slider animation   
-    fig, ax = plt.subplots(1, 1, figsize=(8, 6))
-    plt.subplots_adjust(bottom=0.15)
-    ax_slider = fig.add_axes([0.2, 0.01, 0.6, 0.03])  # [left, bottom, width, height]
-
-    def update_plot(frame_idx):
-        ax.cla()  # clear current axes
-        ax.plot(ts, solutions_ts[frame_idx, :], color='r', label='simulation')
-        ax.plot(ts, target, color='r', linestyle='--', label='target')
-        ax.set_xlim(ts[0], ts[-1])
-        ax.set_ylim(y_lower, y_upper)
-        ax.set_xlabel("t [s]")
-        ax.set_ylabel("x [m]")
-        ax.set_title(f"Optimization (iteration n. {frame_idx})")
-        ax.grid(True)
-        ax.legend()
-        fig.canvas.draw_idle()
-
-    slider = Slider(
-        ax=ax_slider,
-        label="Iter.",
-        valmin=0,
-        valmax=len(solutions_ts) - 1,
-        valinit=0,
-        valstep=1,
-    )
-    slider.on_changed(update_plot)
-
-    update_plot(0)  # initial plot
-
-    if show:
-        plt.show()
-    plt.close(fig)
-    
-    # Create animation to be saved
-    if save and savepath is None:
-        print('Optimization animation not saved: must provide a path where the animation can be saved.')
-
-    elif save and savepath is not None:        
-        fig, ax = plt.subplots(1, 1, figsize=(8, 6))
-
-        (line_sim,) = ax.plot([], [], color="r", label='simulation')
-        (line_tar,) = ax.plot([], [], color="r", linestyle='--', label='target')
-        ax.set_xlim(ts[0], ts[-1])
-        ax.set_ylim(y_lower, y_upper)
-        ax.set_xlabel("t [s]")
-        ax.set_ylabel("x [m]")
-        title_text = ax.set_title(f"Optimization (iteration n. 0)")
-        ax.grid(True)
-        ax.legend()
-        fig.tight_layout()
-
-        def init():
-            line_sim.set_data([], [])
-            line_tar.set_data(ts, target)
-            title_text.set_text(f"Optimization (iteration n. 0)")
-            return line_sim, line_tar, title_text
-
-        def update(frame_idx):
-            line_sim.set_data(ts, solutions_ts[frame_idx, :])
-            title_text.set_text(f"Optimization (iteration n. {frame_idx})")
-            return (line_sim, line_tar, title_text)
-        
-        ani = FuncAnimation(
-            fig,
-            update,
-            frames=len(solutions_ts),
-            init_func=init,
-            blit=True
-        )
-
-        ani.save(savepath, writer="pillow", fps=len(solutions_ts)/10)
-        plt.close(fig)
-
-# Folder for plots and videos
-curr_folder = Path(__file__).parent
-plots_folder = curr_folder/'plots and videos'/Path(__file__).stem
-plots_folder.mkdir(parents=True, exist_ok=True)
-
-# Folder for saving data
-data_folder = curr_folder/'saved data'/Path(__file__).stem
-data_folder.mkdir(parents=True, exist_ok=True)
 
 
 # =====================================================
@@ -577,10 +483,9 @@ plt.savefig(plots_folder/'Loss')
 
 plot_optimiz_evolution(
     ts=t_target,
-    solutions_ts=solutions_ts,
-    target=target,
+    solutions=solutions_ts,
+    targets=target,
     show=True,
-    save=True,
     savepath=plots_folder/'optimization_animation.gif'
 )
 
