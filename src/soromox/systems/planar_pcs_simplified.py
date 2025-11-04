@@ -2076,8 +2076,10 @@ class PlanarPCS_simple(DynamicalSystem):
         else:
             raise ValueError("actuation_args must be a tuple of length 1 or 2.")
 
-        if u is None:
-            u = jnp.zeros((self.num_actuators,))
+        if callable(u):
+            u = u(t)
+        else:
+            u = u if u is not None else jnp.zeros((self.num_actuators,))
         if tau_ext is None:
             tau_ext = jnp.zeros((q.shape[-1],))
 
