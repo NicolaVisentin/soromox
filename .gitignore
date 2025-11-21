@@ -1,5 +1,12 @@
 **/__MACOSX/**
 
+# Custom
+examples/optimization/plots and videos/*
+!examples/optimization/plots and videos/.gitkeep
+
+examples/optimization/saved data/*
+!examples/optimization/saved data/.gitkeep
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

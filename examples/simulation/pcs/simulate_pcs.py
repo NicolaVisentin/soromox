@@ -1,3 +1,7 @@
+# Choose device (cpu or gpu)
+import os
+os.environ["JAX_PLATFORM_NAME"] = "cpu"
+
 from diffrax import Tsit5
 from functools import partial
 
