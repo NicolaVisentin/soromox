@@ -7,6 +7,7 @@ from jax import numpy as jnp
 import optax
 import matplotlib.pyplot as plt
 from soromox.systems import pendulum
+from soromox.systems.system_state import SystemState
 
 jax.config.update("jax_enable_x64", True)  # double precision
 
@@ -38,18 +39,21 @@ if __name__ == "__main__":
 
     # initialize velocities and actuation
     qd0 = jnp.zeros_like(q0)  # initial velocities for simulation
+    initial_state = SystemState(t=t0, y=jnp.concatenate([q0, qd0]))
     u = jnp.zeros_like(q0)  # torques (actuation)
 
     # Integrate using the model's built-in solver
-    ts_out, q_ts, qd_ts = robot.resolve_upon_time(
-        q0=q0,
-        qd0=qd0,
+    sim_out = robot.rollout_to(
+        initial_state=initial_state,
         u=u,
-        t0=t0,
         t1=t1,
-        dt=dt,
+        solver_dt=dt,
         save_dt=save_dt,
     )
+
+    # Extract results
+    ts_out = sim_out.t
+    q_ts, qd_ts = jnp.split(sim_out.y, 2, axis=1)
     
 
     # =====================================================
@@ -92,16 +96,15 @@ if __name__ == "__main__":
         robot_updated = robot.update_params({"L": L})
 
         # simulation
-        _, q_ts, _ = robot_updated.resolve_upon_time(
-            q0=q0,
-            qd0=qd0,
+        sim_out = robot_updated.rollout_to(
+            initial_state=initial_state,
             u=u,
-            t0=t0,
             t1=t1,
-            dt=dt,
+            solver_dt=dt,
             save_dt=save_dt,
             max_steps=int(1e5)
         )
+        q_ts, _ = jnp.split(sim_out.y, 2, axis=1)
         ee_final = robot_updated.forward_kinematics_tips(q_ts[-1,:])[-1, 1:]
         J = (ee_final-target).T @ (ee_final-target)
 
@@ -141,16 +144,16 @@ if __name__ == "__main__":
     print("Optimal lengths:", L_opt)
 
     robot = robot.update_params({'L': L_opt})
-    ts_out, q_ts, _ = robot.resolve_upon_time(
-            q0=q0,
-            qd0=qd0,
+    sim_out = robot.rollout_to(
+            initial_state=initial_state,
             u=u,
-            t0=t0,
             t1=t1,
-            dt=dt,
+            solver_dt=dt,
             save_dt=save_dt,
             max_steps=int(1e5)
         )
+    ts_out = sim_out.t
+    q_ts, _ = jnp.split(sim_out.y, 2, axis=1)
     ee_final = robot.forward_kinematics_tips(q_ts[-1,:])[-1, 1:]
     print(f'ee: {ee_final}')
     print(f'target: {target}')

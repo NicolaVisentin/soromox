@@ -24,7 +24,9 @@ from pathlib import Path
 from tqdm import tqdm
 import time
 
+from soromox.systems.system_state import SystemState
 from soromox.systems.planar_pcs import PlanarPCS
+from soromox.systems.planar_pcs_simplified import PlanarPCS_simple
 from soromox.utils.lie_algebra.se2 import exp_SE2
 from my_utilis import *
 
@@ -218,7 +220,7 @@ parameters = {
     "D": D
 }
 
-robot = PlanarPCS(
+robot = PlanarPCS_simple(
     num_segments = N,
     params = parameters,
     order_gauss = 5
@@ -239,22 +241,23 @@ solver = Tsit5() # Tsit5(), Euler(), Heun(), Midpoint(), Ralston(), Bosh3(), Dop
 #step_size = PIDController(rtol=1e-6, atol=1e-6, dtmin=1e-3, force_dtmin=True) # ConstantStepSize(), PIDController(rtol=, atol=)
 step_size = ConstantStepSize()
 max_steps = int(1e5)
+initial_state = SystemState(t=t0, y=jnp.concatenate([q0, qd0]))
 
 # Simulate robot
 print('Simulating robot...')
 start = time.perf_counter()
-ts, q_ts, _ = robot.resolve_upon_time(
-    q0 = q0, 
-    qd0 = qd0,
+sim_out = robot.rollout_to(
+    initial_state= initial_state,
     u = u, 
-    t0 = t0, 
     t1 = t1, 
-    dt = dt, 
-    saveat_ts = save_at,
+    solver_dt = dt, 
+    save_ts = save_at,
     solver = solver,
     stepsize_controller = step_size,
     max_steps = max_steps
 )
+ts = sim_out.t
+q_ts, _ = jnp.split(sim_out.y, 2, axis=1)
 end = time.perf_counter()
 print(f'Elapsed time (simulation, {solver}): {end-start} s')
 
@@ -333,18 +336,17 @@ def Loss(params_softplus):
     robot_updated = robot.update_params({"L": L}) # update robot
 
     # simulation
-    _, q_ts, _ = robot_updated.resolve_upon_time(
-        q0 = q0, 
-        qd0 = qd0,
+    sim_out = robot_updated.rollout_to(
+        initial_state=initial_state,
         u = u, 
-        t0 = t0, 
         t1 = t1, 
-        dt = dt, 
-        saveat_ts = save_at,
+        solver_dt = dt, 
+        save_ts = save_at,
         solver = solver,
         stepsize_controller = step_size,
         max_steps = max_steps
     )
+    q_ts, _ = jnp.split(sim_out.y, 2, axis=1)
 
     # compute displacements in the local reference frames
     chiG_1_ts = jax.vmap(robot_updated.forward_kinematics, in_axes=(0,None))(q_ts, L[0])       # chi = [th, x, y] in the GLOBAL frame. Shape (n_steps, 3)

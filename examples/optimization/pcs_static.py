@@ -18,6 +18,7 @@ from matplotlib.widgets import Slider
 from matplotlib.ticker import MaxNLocator
 from pathlib import Path
 from soromox.systems.pcs import PCS
+from soromox.systems.system_state import SystemState
 
 jax.config.update("jax_enable_x64", True)  # double precision
 jnp.set_printoptions(
@@ -185,19 +186,20 @@ dt = 1e-3
 save_dt = 100*dt
 solver = Tsit5()
 max_steps = int(1e6)
+initial_state = SystemState(t=t0, y=jnp.concatenate([q0, qd0]))
 
 # Simulate robot
-ts, q_ts, _ = robot.resolve_upon_time(
-    q0 = q0, 
-    qd0 = qd0,
+sim_out = robot.rollout_to(
+    initial_state=initial_state,
     u = u, 
-    t0 = t0, 
     t1 = t1, 
-    dt = dt, 
+    solver_dt = dt, 
     save_dt = save_dt, 
     solver = solver,
     max_steps = max_steps
 )
+ts = sim_out.t
+q_ts, _ = jnp.split(sim_out.y, 2, axis=1)
 g_ee_ts = jax.vmap(robot.forward_kinematics, in_axes=(0,None))(q_ts,jnp.sum(L))
 ee_ts = g_ee_ts[:,:3,-1]
 
@@ -275,17 +277,16 @@ def Loss(L_softplus):
     robot_updated = robot.update_params({"L": L}) # update robot
 
     # simulation
-    _, q_ts, _ = robot_updated.resolve_upon_time(
-        q0 = q0, 
-        qd0 = qd0,
+    sim_out = robot_updated.rollout_to(
+        initial_state=initial_state,
         u = u, 
-        t0 = t0, 
         t1 = t1, 
-        dt = dt, 
+        solver_dt = dt, 
         save_dt = save_dt, 
         solver = solver,
         max_steps = max_steps
     )                                              # simulate
+    q_ts, _ = jnp.split(sim_out.y, 2, axis=1)
     ee_final = robot_updated.forward_kinematics(q_ts[-1,:],jnp.sum(L))[:3,-1]
     P = jnp.diag(jnp.array([1,1,3e3]))
     J = (ee_final-target).T @ P @ (ee_final-target)
@@ -343,17 +344,17 @@ plt.savefig(plots_folder/'Loss')
 robot_opt = robot.update_params({"L": L_opt})
 
 # Simulate the optimized robot
-ts, q_ts, qd_ts = robot_opt.resolve_upon_time(
-    q0=q0,
-    qd0=qd0,
+sim_out = robot_opt.rollout_to(
+    initial_state=initial_state,
     u=u,
-    t0=t0,
     t1=t1,
-    dt=dt,
+    solver_dt=dt,
     save_dt=save_dt,
     solver=solver,
     max_steps=None,
 )
+ts = sim_out.t
+q_ts, qd_ts = jnp.split(sim_out.y, 2, axis=1)
 g_ee_ts = jax.vmap(robot_opt.forward_kinematics, in_axes=(0,None))(q_ts,jnp.sum(L_opt))
 ee_ts = g_ee_ts[:,:3,-1]
 

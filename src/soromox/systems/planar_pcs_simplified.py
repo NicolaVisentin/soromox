@@ -64,6 +64,9 @@ class PlanarPCS_simple(DynamicalSystem):
                 - sigma_x corresponds to axial strain along the x-axis,
                 - sigma_y corresponds to shear along the y-axis.
 
+    References:
+    ----------
+    - Renda, Federico, Frédéric Boyer, Jorge Dias, and Lakmal Seneviratne. "Discrete cosserat approach for multisection soft manipulator dynamics." IEEE Transactions on Robotics 34, no. 6 (2018): 1518-1533.
     """
 
     # Robot parameters
@@ -2076,10 +2079,8 @@ class PlanarPCS_simple(DynamicalSystem):
         else:
             raise ValueError("actuation_args must be a tuple of length 1 or 2.")
 
-        if callable(u):
-            u = u(t)
-        else:
-            u = u if u is not None else jnp.zeros((self.num_actuators,))
+        if u is None:
+            u = jnp.zeros((self.num_actuators,))
         if tau_ext is None:
             tau_ext = jnp.zeros((q.shape[-1],))
 
