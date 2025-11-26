@@ -29,7 +29,7 @@ import select
 
 from soromox.systems.system_state import SystemState
 from soromox.systems.planar_pcs import PlanarPCS
-from soromox.systems.planar_pcs_simplified import PlanarPCS_simple
+from soromox.systems.my_systems import PlanarPCS_simple
 from soromox.utils.lie_algebra.se2 import exp_SE2
 from my_utilis import *
 
