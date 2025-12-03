@@ -121,20 +121,19 @@ class PlanarPCS_simple_modified(PlanarPCS_simple):
 
     Additional attributes
     ---------------------
-    A : Array
+    A_Tin : Array
         Transform q = A*y + c.
-    c : Array
+    c_Tin : Array
         Transform q = A*y + c.
     """
     A_Tin: Array = eqx.field()
     c_Tin: Array = eqx.field()
 
     def __init__(self, *args, A=None, c=None, **kwargs):
-        # Prima inizializzi i campi frozen
+        # New attributes
         object.__setattr__(self, "A_Tin", A)
         object.__setattr__(self, "c_Tin", c)
-
-        # Poi chiami il costruttore della classe base
+        # Inherited attributes
         super().__init__(*args, **kwargs)
 
     @eqx.filter_jit
