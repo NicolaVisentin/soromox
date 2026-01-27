@@ -23,14 +23,11 @@ jnp.set_printoptions(
 
 if __name__ == "__main__":
     num_segments = 2
-    rho = 1070 * jnp.ones(
-        (num_segments,)
-    )  # Volumetric density of Dragon Skin 20 [kg/m^3]
     params = {
         "th0": jnp.array(jnp.pi / 2),  # initial orientation angle [rad]
         "L": 1e-1 * jnp.ones((num_segments,)),
         "r": 2e-2 * jnp.ones((num_segments,)),
-        "rho": rho,
+        "rho": 1070 * jnp.ones((num_segments,)), # Volumetric density of Dragon Skin 20 [kg/m^3]
         "g": jnp.array([0.0, 9.81]),  # gravity vector [m/s^2] UP!
         "E": 2e3 * jnp.ones((num_segments,)),  # Elastic modulus [Pa]
         "G": 1e3 * jnp.ones((num_segments,)),  # Shear modulus [Pa]
