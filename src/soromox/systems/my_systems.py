@@ -6,7 +6,7 @@ from jax import numpy as jnp
 import numpy as onp
 from typing import Callable, Dict, Tuple, Optional, ClassVar
 
-from soromox.systems.planar_pcs import PlanarPCS
+from soromox.systems.pcs.planar_pcs import PlanarPCS
 from soromox.utils.integration import scale_gaussian_quadrature
 import soromox.utils.lie_algebra as lie
 
