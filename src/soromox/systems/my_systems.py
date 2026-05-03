@@ -1,4 +1,4 @@
-__all__ = ["PlanarPCS_simple", "PlanarPCS_simple_modified"]
+__all__ = ["PlanarPCS_simple"]
 import equinox as eqx
 import jax
 from jax import Array, lax, vmap
