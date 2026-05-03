@@ -7,6 +7,7 @@ from abc import abstractmethod
 from enum import IntEnum
 from typing import Any
 
+import equinox as eqx
 from jax import Array, vmap
 from jax import numpy as jnp
 
@@ -40,10 +41,24 @@ class SoftRobot(DynamicalSystem):
         num_dofs (int): Number of degrees of freedom (configuration variables).
         num_actuators (int): Number of actuators.
         global_eps (float): Global epsilon for numerical computations.
+        num_gauss_points (int | Array | None): Requested nonzero
+            Gauss-Legendre quadrature point count. May be scalar for systems
+            with a uniform grid or an array for systems with per-segment grids.
+        num_integration_points (int | Array | None): Stored integration point
+            count, including any zero-weight boundary nodes used internally.
+            May be scalar or per-segment.
+        integration_points (Array | None): Quadrature nodes used for numerical
+            integration, typically on the normalized interval [0, 1].
+        integration_weights (Array | None): Quadrature weights corresponding
+            to `integration_points`.
     """
 
     # global epsilon for numerical computations
     global_eps: float  # Global epsilon for numerical computations
+    num_gauss_points: int | Array | None
+    num_integration_points: int | Array | None
+    integration_points: Array | None
+    integration_weights: Array | None
 
     @property
     def tangent_eps(self) -> Array:
@@ -65,10 +80,24 @@ class SoftRobot(DynamicalSystem):
         # Note: We don't call super().__init__() here because Equinox modules
         # work like dataclasses - fields are set directly rather than through
         # parent __init__ calls. Child classes must set num_dofs and num_actuators.
+        self.num_gauss_points = None
+        self.num_integration_points = None
+        self.integration_points = None
+        self.integration_weights = None
         if eps is not None:
             self.global_eps = eps
         else:
             self.global_eps = 1e1 * float(jnp.finfo(jnp.float64).eps)
+
+    def precompute(self) -> None:
+        """
+        Optional hook for refreshing state-independent cached quantities.
+
+        Subclasses with cached mass, stiffness, damping, basis, or quadrature
+        data can override this method and call it during initialization. Models
+        without such caches can inherit this no-op implementation.
+        """
+        return None
 
     @property
     @abstractmethod
@@ -122,6 +151,22 @@ class SoftRobot(DynamicalSystem):
         """
         ...
 
+    @abstractmethod
+    def forward_kinematics_tips(self, q: Array) -> Array:
+        """
+        Compute the forward kinematics at all segment or link tips.
+
+        Args:
+            q: Generalized coordinates of shape (num_dofs,).
+
+        Returns:
+            chi_tips: Poses at the robot tips. The shape and meaning depend on
+                the robot type:
+                - For 3D robots (PCS, GVS): shape (num_segments, 4, 4)
+                - For planar robots (PlanarPCS, Pendulum): shape (num_segments, 3)
+        """
+        ...
+
     def forward_kinematics_batched(self, q: Array, s_ps: Array) -> Array:
         """
         Compute the forward kinematics at multiple points along the robot.
@@ -155,6 +200,20 @@ class SoftRobot(DynamicalSystem):
                 depends on the robot type:
                 - For 3D robots (PCS): 6 (angular velocity + linear velocity)
                 - For planar robots (PlanarPCS, Pendulum): 3 (omega_z, v_x, v_y)
+        """
+        ...
+
+    @abstractmethod
+    def jacobian_tips(self, q: Array) -> Array:
+        """
+        Compute inertial-frame Jacobians at all segment or link tips.
+
+        Args:
+            q: Generalized coordinates of shape (num_dofs,).
+
+        Returns:
+            J_tips: Inertial-frame Jacobians at the robot tips, with shape
+                (num_tips, n_pose_dim, num_dofs).
         """
         ...
 
@@ -290,6 +349,40 @@ class SoftRobot(DynamicalSystem):
             G: Gravitational force of shape (num_dofs,).
         """
         ...
+
+    @eqx.filter_jit
+    def actuation_matrix(self, q: Array) -> Array:
+        """
+        Compute the actuation matrix of the robot.
+
+        Args:
+            q (Array): generalized coordinates of shape (num_dofs,).
+
+        Returns:
+            A (Array): Actuation matrix of shape (num_dofs, num_actuators).
+        """
+        A = jnp.zeros((self.num_dofs, self.num_actuators))
+        return A
+
+    @eqx.filter_jit
+    def actuation_force(self, q: Array, u: Array) -> Array:
+        """
+        Compute the actuation force acting on the robot.
+
+        Args:
+            q (Array): generalized coordinates of shape (num_dofs,).
+            u (Array): actuation/control input of shape (num_actuators,).
+
+        Returns:
+            tau_u (Array): Actuation force of shape (num_dofs, ).
+        """
+        # evaluate the actuation matrix
+        A = self.actuation_matrix(q)
+
+        # compute the actuation force
+        tau_u = A @ u
+
+        return tau_u
 
     # -----------------------------------------
     # Energy methods

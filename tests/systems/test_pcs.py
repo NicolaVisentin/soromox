@@ -1,15 +1,14 @@
 import jax
+import numpy as onp
+import pytest
 from jax import Array, jacfwd, jacrev, jvp
 from jax import numpy as jnp
 from numpy.testing import assert_allclose
-import numpy as onp
-import pytest
-from typing import List, Optional
 
-from soromox.systems import PCS
+from soromox.systems import PCS, CrossSectionGeometry
+from soromox.utils.integration import scale_interior_gaussian_quadrature
 from soromox.utils.lie_algebra.se3 import Adjoint_g_SE3, log_SE3
 from soromox.utils.tolerance import Tolerance
-
 
 jax.config.update("jax_enable_x64", True)  # double precision
 
@@ -25,10 +24,11 @@ NUM_IK_SAMPLES = 10
 
 def make_pcs(
     num_segments: int = 2,
-    xi_ref: Optional[Array] = None,
+    xi_ref: Array | None = None,
     total_length: float = PCS_TOTAL_LENGTH,
-    order_gauss: int = 3,
-    strain_selector: Optional[Array] = None,
+    num_gauss_points: int = 3,
+    strain_selector: Array | None = None,
+    scale_rotational_basis_by_length: bool = False,
 ):
     segment_length = total_length / num_segments
     L = segment_length * jnp.ones((num_segments,))
@@ -52,15 +52,16 @@ def make_pcs(
     model = PCS(
         num_segments=num_segments,
         params=params,
-        order_gauss=order_gauss,
+        num_gauss_points=num_gauss_points,
         xi_ref=xi_ref,
         strain_selector=strain_selector,
+        scale_rotational_basis_by_length=scale_rotational_basis_by_length,
     )
 
     return model, params
 
 
-def sample_arc_lengths(model: PCS) -> List[float]:
+def sample_arc_lengths(model: PCS) -> list[float]:
     lengths = jnp.asarray(model.L)
     cumulative = jnp.cumsum(lengths)
     total = float(cumulative[-1])
@@ -77,6 +78,13 @@ def sample_arc_lengths(model: PCS) -> List[float]:
 def random_q(model: PCS, key: Array, scale: float = 0.05) -> Array:
     n = int(model.num_active_strains.item())
     return scale * jax.random.normal(key, (n,))
+
+
+def expected_selection_basis(num_rows: int, active_indices: tuple[int, ...]) -> Array:
+    basis = jnp.zeros((num_rows, len(active_indices)), dtype=jnp.float64)
+    for col, row in enumerate(active_indices):
+        basis = basis.at[row, col].set(1.0)
+    return basis
 
 
 def se3_inverse(g: Array) -> Array:
@@ -143,7 +151,7 @@ def test_constant_strain_call():
     robot = PCS(
         num_segments=num_segments,
         params=params,
-        order_gauss=5,
+        num_gauss_points=5,
         strain_selector=strain_selector,
         xi_ref=xi_ref,
     )
@@ -282,6 +290,24 @@ def test_constant_strain_call():
     print("[Valid test]\n")
 
 
+def test_public_pcs_accessors_and_geometry_helpers() -> None:
+    model, params = make_pcs(num_segments=2)
+    q = jnp.zeros((int(model.num_active_strains.item()),), dtype=jnp.float64)
+
+    assert model.is_planar is False
+    assert_allclose(model.length, jnp.sum(params["L"]), rtol=RTOL, atol=ATOL)
+    assert_allclose(model.segment_length, params["L"], rtol=RTOL, atol=ATOL)
+
+    s_second = params["L"][0] + 0.25 * params["L"][1]
+    segment_idx, s_local = model.classify_segment(s_second)
+    assert int(segment_idx) == 1
+    assert_allclose(s_local, 0.25 * params["L"][1], rtol=RTOL, atol=ATOL)
+
+    tag, geom = model.cross_section_geometry(q, s_second)
+    assert int(tag) == CrossSectionGeometry.CIRCULAR
+    assert_allclose(geom, jnp.array([params["r"][1]]), rtol=RTOL, atol=ATOL)
+
+
 @pytest.mark.parametrize("num_segments", [1, 2, 3])
 def test_forward_kinematics_tips_matches_pointwise_evaluation(
     num_segments: int,
@@ -368,15 +394,15 @@ def test_J_local_tips_matches_pointwise_evaluation(num_segments: int):
     model, _ = make_pcs(num_segments=num_segments, total_length=PCS_TOTAL_LENGTH)
     q = random_q(model, jax.random.PRNGKey(5), scale=0.03)
 
-    J_tips = model._J_local_tips(q)
+    J_tips_ = model._J_local_tips(q)
     s_tips = model.L_cum[1:]
 
     for idx, s in enumerate(s_tips):
         if s < 1e-3:
             continue
 
-        J_tip_batch = J_tips[idx]
-        J_tip_single = model._J_local(q, s)
+        J_tip_batch = J_tips_[idx] @ model.B_xi
+        J_tip_single = model.jacobian_bodyframe(q, s)
 
         assert_allclose(
             J_tip_batch,
@@ -391,7 +417,9 @@ def test_J_local_tips_matches_pointwise_evaluation(num_segments: int):
 
 
 @pytest.mark.parametrize("num_segments", [1, 2, 3])
-def test_J_local_batched_matches_pointwise_evaluation(num_segments: int) -> None:
+def test_jacobian_bodyframe_batched_matches_pointwise_evaluation(
+    num_segments: int,
+) -> None:
     model, _ = make_pcs(num_segments=num_segments)
     dof = int(model.num_active_strains.item())
 
@@ -403,10 +431,10 @@ def test_J_local_batched_matches_pointwise_evaluation(num_segments: int) -> None
     s_points = jnp.asarray(sample_arc_lengths(model), dtype=jnp.float64)
 
     for q in (zero_cfg, q_random):
-        J_batch = model._J_local_batched(q, s_points)
+        J_batch = model.jacobian_bodyframe_batched(q, s_points)
 
         for idx, s_val in enumerate(s_points):
-            J_single = model._J_local(q, s_val)
+            J_single = model.jacobian_bodyframe(q, s_val)
             assert_allclose(J_batch[idx], J_single, rtol=RTOL, atol=ATOL)
 
 
@@ -596,6 +624,43 @@ def test_jacobian_inertialframe_matches_central_differences(num_segments: int):
 
 
 @pytest.mark.parametrize("num_segments", [1, 2])
+def test_jacobian_inertialframe_batched_matches_pointwise_evaluation(
+    num_segments: int,
+) -> None:
+    model, _ = make_pcs(num_segments=num_segments)
+    dof = int(model.num_active_strains.item())
+
+    zero_cfg = jnp.zeros((dof,), dtype=jnp.float64)
+
+    rng = jax.random.PRNGKey(7890)
+    random_cfg = random_q(model, rng, scale=0.05)
+
+    s_points = jnp.asarray(sample_arc_lengths(model), dtype=jnp.float64)
+
+    for q in (zero_cfg, random_cfg):
+        J_batch = model.jacobian_inertialframe_batched(q, s_points)
+
+        for idx, s_val in enumerate(s_points):
+            J_single = model.jacobian_inertialframe(q, s_val)
+            assert_allclose(J_batch[idx], J_single, rtol=RTOL, atol=ATOL)
+
+
+@pytest.mark.parametrize("num_segments", [1, 2])
+def test_jacobian_tips_matches_pointwise_inertialframe_evaluation(
+    num_segments: int,
+) -> None:
+    model, _ = make_pcs(num_segments=num_segments)
+    q = random_q(model, jax.random.PRNGKey(7891), scale=0.05)
+
+    s_tips = model.L_cum[1:]
+    J_tips = model.jacobian_tips(q)
+    J_expected = jax.vmap(lambda s: model.jacobian_inertialframe(q, s))(s_tips)
+
+    assert J_tips.shape == (num_segments, 6, int(model.num_active_strains.item()))
+    assert_allclose(J_tips, J_expected, rtol=RTOL, atol=ATOL)
+
+
+@pytest.mark.parametrize("num_segments", [1, 2])
 def test_jacobian_derivative_bodyframe_matches_autograd_jvp(num_segments: int):
     model, _ = make_pcs(num_segments=num_segments, total_length=PCS_TOTAL_LENGTH)
     key = jax.random.PRNGKey(3)
@@ -667,17 +732,23 @@ def test_J_Jd_local_tips_matches_pointwise_evaluation(num_segments: int) -> None
     s_tips = model.L_cum[1:]
 
     for q, qd in ((zero_cfg, zero_vel), (q_random, qd_random)):
-        J_local_tips, Jd_local_tips = model._J_Jd_local_tips(q, qd)
+        J_local_tips_, Jd_local_tips_ = model._J_Jd_local_tips(q, qd)
 
         for idx, s_tip in enumerate(s_tips):
-            J_local, Jd_local = model._J_Jd_local(q, qd, s_tip)
+            J_local, Jd_local = model.jacobian_and_derivative_bodyframe(q, qd, s_tip)
 
-            assert_allclose(J_local, J_local_tips[idx], rtol=RTOL, atol=ATOL)
-            assert_allclose(Jd_local, Jd_local_tips[idx], rtol=RTOL, atol=ATOL)
+            assert_allclose(
+                J_local, J_local_tips_[idx] @ model.B_xi, rtol=RTOL, atol=ATOL
+            )
+            assert_allclose(
+                Jd_local, Jd_local_tips_[idx] @ model.B_xi, rtol=RTOL, atol=ATOL
+            )
 
 
 @pytest.mark.parametrize("num_segments", [1, 2, 3])
-def test_J_Jd_local_batched_matches_pointwise_evaluation(num_segments: int) -> None:
+def test_jacobian_and_derivative_bodyframe_batched_matches_pointwise_evaluation(
+    num_segments: int,
+) -> None:
     model, _ = make_pcs(num_segments=num_segments)
     dof = int(model.num_active_strains.item())
 
@@ -691,10 +762,12 @@ def test_J_Jd_local_batched_matches_pointwise_evaluation(num_segments: int) -> N
     s_points = jnp.asarray(sample_arc_lengths(model), dtype=jnp.float64)
 
     for q, qd in ((zero_cfg, zero_vel), (q_random, qd_random)):
-        J_batch, Jd_batch = model._J_Jd_local_batched(q, qd, s_points)
+        J_batch, Jd_batch = model.jacobian_and_derivative_bodyframe_batched(
+            q, qd, s_points
+        )
 
         for idx, s_val in enumerate(s_points):
-            J_single, Jd_single = model._J_Jd_local(q, qd, s_val)
+            J_single, Jd_single = model.jacobian_and_derivative_bodyframe(q, qd, s_val)
             assert_allclose(J_batch[idx], J_single, rtol=RTOL, atol=ATOL)
             assert_allclose(Jd_batch[idx], Jd_single, rtol=RTOL, atol=ATOL)
 
@@ -722,6 +795,91 @@ def test_jacobian_derivative_inertialframe_matches_autograd_jvp(num_segments: in
             assert jnp.allclose(Jd_impl, Jd_jvp, rtol=1e-6, atol=1e-7), (
                 f"num_segments={num_segments}, s={s}\nJd_impl:\n{onp.array(Jd_impl)}\nJd_jvp:\n{onp.array(Jd_jvp)}"
             )
+
+
+@pytest.mark.parametrize("num_segments", [1, 2])
+def test_jacobian_and_derivative_inertialframe_batched_matches_pointwise_evaluation(
+    num_segments: int,
+) -> None:
+    model, _ = make_pcs(num_segments=num_segments)
+    dof = int(model.num_active_strains.item())
+
+    zero_cfg = jnp.zeros((dof,), dtype=jnp.float64)
+    zero_vel = jnp.zeros((dof,), dtype=jnp.float64)
+
+    rng = jax.random.PRNGKey(7890)
+    q_random = random_q(model, rng, scale=0.05)
+    qd_random = random_q(model, jax.random.PRNGKey(9876), scale=0.1)
+
+    s_points = jnp.asarray(sample_arc_lengths(model), dtype=jnp.float64)
+
+    for q, qd in ((zero_cfg, zero_vel), (q_random, qd_random)):
+        J_batch, Jd_batch = model.jacobian_and_derivative_inertialframe_batched(
+            q, qd, s_points
+        )
+
+        for idx, s_val in enumerate(s_points):
+            J_single, Jd_single = model.jacobian_and_derivative_inertialframe(
+                q, qd, s_val
+            )
+            assert_allclose(J_batch[idx], J_single, rtol=RTOL, atol=ATOL)
+            assert_allclose(Jd_batch[idx], Jd_single, rtol=RTOL, atol=ATOL)
+
+
+def test_public_pcs_jacobian_aliases_match_inertialframe_methods() -> None:
+    model, _ = make_pcs(num_segments=2)
+    key_q, key_qd = jax.random.split(jax.random.PRNGKey(2027))
+    q = random_q(model, key_q, scale=0.03)
+    qd = random_q(model, key_qd, scale=0.04)
+    s = 0.6 * model.length
+    s_ps = jnp.asarray(sample_arc_lengths(model), dtype=jnp.float64)
+
+    assert_allclose(
+        model.jacobian(q, s),
+        model.jacobian_inertialframe(q, s),
+        rtol=RTOL,
+        atol=ATOL,
+    )
+    assert_allclose(
+        model.jacobian_batched(q, s_ps),
+        model.jacobian_inertialframe_batched(q, s_ps),
+        rtol=RTOL,
+        atol=ATOL,
+    )
+
+    J, Jd = model.jacobian_and_derivative(q, qd, s)
+    J_expected, Jd_expected = model.jacobian_and_derivative_inertialframe(q, qd, s)
+    assert_allclose(J, J_expected, rtol=RTOL, atol=ATOL)
+    assert_allclose(Jd, Jd_expected, rtol=RTOL, atol=ATOL)
+
+    J_batch, Jd_batch = model.jacobian_and_derivative_batched(q, qd, s_ps)
+    J_batch_expected, Jd_batch_expected = (
+        model.jacobian_and_derivative_inertialframe_batched(q, qd, s_ps)
+    )
+    assert_allclose(J_batch, J_batch_expected, rtol=RTOL, atol=ATOL)
+    assert_allclose(Jd_batch, Jd_batch_expected, rtol=RTOL, atol=ATOL)
+
+
+@pytest.mark.parametrize("num_segments", [1, 2, 3])
+def test_inertia_matrix_matches_kinetic_energy_autodiff(num_segments: int):
+    robot, _ = make_pcs(num_segments=num_segments)
+    key = jax.random.PRNGKey(2)
+    q_keys = jax.random.split(key, NUM_RANDOM_SAMPLES)
+    qd_keys = jax.random.split(key + 1, NUM_RANDOM_SAMPLES)
+
+    for q_key, qd_key in zip(q_keys, qd_keys):
+        q = random_q(robot, q_key, scale=0.05)
+        qd = random_q(robot, qd_key, scale=0.2)
+
+        B_impl = robot.inertia_matrix(q)
+
+        def T_of_qd(qd_):
+            return robot.kinetic_energy(q, qd_)
+
+        dT_dqdsq = jacfwd(jax.grad(T_of_qd))(qd)
+        B_expected = dT_dqdsq
+
+        assert_allclose(B_impl, B_expected, rtol=RTOL, atol=ATOL)
 
 
 @pytest.mark.parametrize("num_segments", [1, 2, 3])
@@ -791,6 +949,15 @@ def test_gravity_matches_potential_gradient(num_segments: int):
         assert_allclose(G, dU_G_dq, rtol=RTOL, atol=ATOL)
 
 
+def test_pcs_gravitational_energy_gradient_matches_force() -> None:
+    model, _ = make_pcs(num_segments=1)
+    q = random_q(model, jax.random.PRNGKey(314), scale=0.02)
+
+    dU_dq = jax.grad(lambda q_: model.gravitational_energy(q_))(q)
+
+    assert_allclose(dU_dq, model.gravitational_force(q), rtol=RTOL, atol=ATOL)
+
+
 @pytest.mark.parametrize("num_segments", [1, 2, 3])
 def test_forward_dynamics_matches_manual_computation(num_segments: int):
     model, _ = make_pcs(num_segments=num_segments, total_length=PCS_TOTAL_LENGTH)
@@ -821,16 +988,294 @@ def test_forward_dynamics_matches_manual_computation(num_segments: int):
         tau_el = model.elastic_force(q)
         tau_u = model.actuation_force(q, u)
 
-        B_inv = jnp.linalg.inv(B)
-        qdd_expected = B_inv @ (tau_u + tau_ext - C @ qd - G - tau_el - D @ qd)
+        qdd_expected = jnp.linalg.solve(
+            B, tau_u + tau_ext - C @ qd - G - tau_el - D @ qd
+        )
         yd_expected = jnp.concatenate([qd, qdd_expected])
 
         assert_allclose(yd, yd_expected, rtol=RTOL, atol=ATOL)
 
 
+@pytest.mark.parametrize("num_segments", [1, 3])
+@pytest.mark.parametrize(
+    "selector_per_segment",
+    [
+        None,
+        (False, False, True, True, False, False),
+        (False, False, False, True, False, False),
+    ],
+)
+def test_active_quadrature_kinematics_matches_existing_batched_path(
+    num_segments: int, selector_per_segment: tuple[bool, ...] | None
+):
+    strain_selector = (
+        None
+        if selector_per_segment is None
+        else jnp.tile(jnp.asarray(selector_per_segment, dtype=bool), num_segments)
+    )
+    model, _ = make_pcs(num_segments=num_segments, strain_selector=strain_selector)
+    dof = int(model.num_active_strains.item())
+
+    key_q, key_qd = jax.random.split(jax.random.PRNGKey(6123))
+    q = random_q(model, key_q, scale=0.05)
+    qd = random_q(model, key_qd, scale=0.1)
+
+    weights, g_quads, J_quads, Jd_quads = model._active_quadrature_kinematics(q, qd)
+    Xs_scaled, weights_expected = jax.vmap(
+        scale_interior_gaussian_quadrature, in_axes=(None, None, 0, 0)
+    )(
+        model.integration_points,
+        model.integration_weights,
+        model.L_cum[:-1],
+        model.L_cum[1:],
+    )
+    s_points = Xs_scaled.reshape(-1)
+    num_inner = model.num_gauss_points
+
+    g_expected = model.forward_kinematics_batched(q, s_points).reshape(
+        num_segments, num_inner, 4, 4
+    )
+    J_full, Jd_full = model._J_Jd_local_batched(q, qd, s_points)
+    J_expected = (J_full @ model.B_xi).reshape(num_segments, num_inner, 6, dof)
+    Jd_expected = (Jd_full @ model.B_xi).reshape(num_segments, num_inner, 6, dof)
+
+    assert_allclose(weights, weights_expected, rtol=RTOL, atol=ATOL)
+    assert_allclose(g_quads, g_expected, rtol=RTOL, atol=ATOL)
+    assert_allclose(J_quads, J_expected, rtol=RTOL, atol=ATOL)
+    assert_allclose(Jd_quads, Jd_expected, rtol=RTOL, atol=ATOL)
+
+    weights_fast, g_fast, J_fast, Jd_fast = model._active_quadrature_kinematics(
+        q, qd, convective_only_jd=True
+    )
+
+    assert_allclose(weights_fast, weights_expected, rtol=RTOL, atol=ATOL)
+    assert_allclose(g_fast, g_expected, rtol=RTOL, atol=ATOL)
+    assert_allclose(J_fast, J_expected, rtol=RTOL, atol=ATOL)
+    assert_allclose(
+        jnp.einsum("ijkl,l->ijk", Jd_fast, qd),
+        jnp.einsum("ijkl,l->ijk", Jd_expected, qd),
+        rtol=RTOL,
+        atol=ATOL,
+    )
+
+
+@pytest.mark.parametrize("num_segments", [1, 3])
+@pytest.mark.parametrize(
+    "selector_per_segment",
+    [
+        None,
+        (False, False, True, True, False, False),
+        (False, False, False, True, False, False),
+    ],
+)
+def test_active_quadrature_forward_dynamics_terms_match_public_matrices(
+    num_segments: int, selector_per_segment: tuple[bool, ...] | None
+):
+    strain_selector = (
+        None
+        if selector_per_segment is None
+        else jnp.tile(jnp.asarray(selector_per_segment, dtype=bool), num_segments)
+    )
+    model, _ = make_pcs(num_segments=num_segments, strain_selector=strain_selector)
+    dof = int(model.num_active_strains.item())
+
+    zero_q = jnp.zeros((dof,), dtype=jnp.float64)
+    zero_qd = jnp.zeros((dof,), dtype=jnp.float64)
+    key_q, key_qd, key_u, key_tau = jax.random.split(jax.random.PRNGKey(6124), 4)
+    random_q_ = random_q(model, key_q, scale=0.05)
+    random_qd = random_q(model, key_qd, scale=0.1)
+    u = random_q(model, key_u, scale=0.2)
+    tau_ext = random_q(model, key_tau, scale=0.03)
+
+    for q, qd in ((zero_q, zero_qd), (random_q_, random_qd)):
+        B, Cqd, G = model._active_quadrature_forward_dynamics_terms(q, qd)
+        C = model.coriolis_matrix(q, qd)
+
+        assert_allclose(B, model.inertia_matrix(q), rtol=RTOL, atol=ATOL)
+        assert_allclose(Cqd, C @ qd, rtol=RTOL, atol=ATOL)
+        assert_allclose(G, model.gravitational_force(q), rtol=RTOL, atol=ATOL)
+
+        y = jnp.concatenate([q, qd])
+        yd = model.forward_dynamics(0.0, y, (u, tau_ext))
+        tau_el = model.elastic_force(q)
+        tau_u = model.actuation_force(q, u)
+        D = model.damping_matrix(q)
+        qdd_expected = jnp.linalg.solve(
+            B, tau_u + tau_ext - C @ qd - G - tau_el - D @ qd
+        )
+        assert_allclose(yd, jnp.concatenate([qd, qdd_expected]), rtol=RTOL, atol=ATOL)
+
+
+def test_cached_constant_matrices_refresh_after_update_params():
+    selector_per_segment = jnp.array(
+        [False, False, True, True, False, False], dtype=bool
+    )
+    model, _ = make_pcs(
+        num_segments=2,
+        strain_selector=jnp.tile(selector_per_segment, 2),
+    )
+
+    updated = model.update_params(
+        {
+            "r": 1.1 * model.r,
+            "rho": 0.9 * model.rho,
+            "E": 1.25 * model.E,
+            "G": 0.75 * model.G,
+            "D": 2.0 * model.D,
+        }
+    )
+    segment_ids = jnp.arange(updated.num_segments)
+    expected_M = jax.vmap(updated._compute_local_mass_matrix)(segment_ids)
+    expected_K_full = updated._compute_stiffness_full_matrix()
+    expected_K = updated.B_xi.T @ expected_K_full @ updated.B_xi
+    expected_D_full = updated.D
+    expected_D = updated.B_xi.T @ expected_D_full @ updated.B_xi
+
+    assert_allclose(updated.M_segments, expected_M, rtol=RTOL, atol=ATOL)
+    assert_allclose(updated.K_full, expected_K_full, rtol=RTOL, atol=ATOL)
+    assert_allclose(updated.K, expected_K, rtol=RTOL, atol=ATOL)
+    assert_allclose(updated.D_full, expected_D_full, rtol=RTOL, atol=ATOL)
+    assert_allclose(updated.D_active, expected_D, rtol=RTOL, atol=ATOL)
+    assert_allclose(updated.stiffness_matrix(), expected_K, rtol=RTOL, atol=ATOL)
+    assert_allclose(
+        updated.damping_matrix(jnp.zeros(updated.num_dofs)),
+        expected_D,
+        rtol=RTOL,
+        atol=ATOL,
+    )
+
+
 # ======================================================================================
 # Strain-basis consistency tests (selection basis applied correctly across APIs)
 # ======================================================================================
+
+
+def test_strain_basis_creation_matches_selector_order():
+    strain_selector = jnp.array(
+        [
+            True,
+            False,
+            True,
+            False,
+            False,
+            True,
+            False,
+            True,
+            False,
+            True,
+            False,
+            False,
+        ],
+        dtype=bool,
+    )
+    model, _ = make_pcs(num_segments=2, strain_selector=strain_selector)
+
+    expected_B = expected_selection_basis(12, (0, 2, 5, 7, 9))
+
+    assert int(model.num_active_strains.item()) == 5
+    assert model.B_xi.shape == (12, 5)
+    assert_allclose(model.B_xi, expected_B, rtol=0.0, atol=0.0)
+    assert_allclose(model.B_xi.T @ model.B_xi, jnp.eye(5), rtol=0.0, atol=0.0)
+
+    q = jnp.arange(1.0, 6.0)
+    expected_xi = expected_B @ q + model.xi_ref
+    assert_allclose(model.strain(q), expected_xi, rtol=RTOL, atol=ATOL)
+
+
+def test_rotational_strain_basis_length_scaling_matches_unscaled_coordinates():
+    num_segments = 2
+    total_length = 0.5
+    segment_length = total_length / num_segments
+    unscaled, _ = make_pcs(
+        num_segments=num_segments,
+        total_length=total_length,
+        num_gauss_points=5,
+        scale_rotational_basis_by_length=False,
+    )
+    scaled, _ = make_pcs(
+        num_segments=num_segments,
+        total_length=total_length,
+        num_gauss_points=5,
+        scale_rotational_basis_by_length=True,
+    )
+
+    per_segment_scale = jnp.array(
+        [1 / segment_length, 1 / segment_length, 1 / segment_length, 1, 1, 1],
+        dtype=jnp.float64,
+    )
+    coordinate_scale = jnp.tile(per_segment_scale, num_segments)
+    coordinate_map = jnp.diag(coordinate_scale)
+
+    assert scaled.scale_rotational_basis_by_length
+    assert_allclose(
+        scaled.B_xi,
+        coordinate_scale[:, None] * unscaled.B_xi,
+        rtol=RTOL,
+        atol=ATOL,
+    )
+
+    q_scaled = jnp.linspace(-0.04, 0.05, int(scaled.num_dofs), dtype=jnp.float64)
+    qd_scaled = jnp.linspace(0.02, -0.03, int(scaled.num_dofs), dtype=jnp.float64)
+    q_unscaled = coordinate_map @ q_scaled
+    qd_unscaled = coordinate_map @ qd_scaled
+
+    assert_allclose(
+        scaled.strain(q_scaled), unscaled.strain(q_unscaled), rtol=RTOL, atol=ATOL
+    )
+
+    for s in sample_arc_lengths(scaled):
+        g_scaled = scaled.forward_kinematics(q_scaled, s)
+        g_unscaled = unscaled.forward_kinematics(q_unscaled, s)
+        assert_allclose(g_scaled, g_unscaled, rtol=RTOL, atol=ATOL)
+
+        J_scaled = scaled.jacobian_bodyframe(q_scaled, s)
+        J_unscaled = unscaled.jacobian_bodyframe(q_unscaled, s)
+        assert_allclose(J_scaled, J_unscaled @ coordinate_map, rtol=RTOL, atol=ATOL)
+
+        J_scaled, Jd_scaled = scaled.jacobian_and_derivative_bodyframe(
+            q_scaled, qd_scaled, s
+        )
+        J_unscaled, Jd_unscaled = unscaled.jacobian_and_derivative_bodyframe(
+            q_unscaled, qd_unscaled, s
+        )
+        assert_allclose(J_scaled, J_unscaled @ coordinate_map, rtol=RTOL, atol=ATOL)
+        assert_allclose(Jd_scaled, Jd_unscaled @ coordinate_map, rtol=RTOL, atol=ATOL)
+
+    assert_allclose(
+        scaled.inertia_matrix(q_scaled),
+        coordinate_map.T @ unscaled.inertia_matrix(q_unscaled) @ coordinate_map,
+        rtol=RTOL,
+        atol=ATOL,
+    )
+    assert_allclose(
+        scaled.gravitational_force(q_scaled),
+        coordinate_map.T @ unscaled.gravitational_force(q_unscaled),
+        rtol=RTOL,
+        atol=ATOL,
+    )
+    assert_allclose(
+        scaled.stiffness_matrix(),
+        coordinate_map.T @ unscaled.stiffness_matrix() @ coordinate_map,
+        rtol=RTOL,
+        atol=ATOL,
+    )
+    assert_allclose(
+        scaled.damping_matrix(q_scaled),
+        coordinate_map.T @ unscaled.damping_matrix(q_unscaled) @ coordinate_map,
+        rtol=RTOL,
+        atol=ATOL,
+    )
+
+    updated = scaled.update_params({"L": jnp.array([0.2, 0.3])})
+    updated_scale = jnp.array(
+        [5.0, 5.0, 5.0, 1.0, 1.0, 1.0, 10 / 3, 10 / 3, 10 / 3, 1.0, 1.0, 1.0]
+    )
+    assert_allclose(
+        updated.B_xi,
+        updated_scale[:, None] * updated.B_xi_unscaled,
+        rtol=RTOL,
+        atol=ATOL,
+    )
 
 
 def _make_full_and_reduced_pcs(num_segments: int, selector_per_segment: Array):
@@ -849,7 +1294,9 @@ def _make_full_and_reduced_pcs(num_segments: int, selector_per_segment: Array):
 @pytest.mark.parametrize("num_segments", [1, 2])
 def test_strain_basis_consistency_strain_and_kinematics(num_segments: int):
     # Select [kappa_z, sigma_x] per segment for 3D PCS
-    selector_per_segment = jnp.array([False, False, True, True, False, False], dtype=bool)
+    selector_per_segment = jnp.array(
+        [False, False, True, True, False, False], dtype=bool
+    )
     full, reduced, B = _make_full_and_reduced_pcs(num_segments, selector_per_segment)
 
     key_q = jax.random.PRNGKey(101)
@@ -889,7 +1336,9 @@ def test_strain_basis_consistency_strain_and_kinematics(num_segments: int):
 
 @pytest.mark.parametrize("num_segments", [1, 2])
 def test_strain_basis_consistency_jacobians_and_derivatives(num_segments: int):
-    selector_per_segment = jnp.array([False, False, True, True, False, False], dtype=bool)
+    selector_per_segment = jnp.array(
+        [False, False, True, True, False, False], dtype=bool
+    )
     full, reduced, B = _make_full_and_reduced_pcs(num_segments, selector_per_segment)
 
     key = jax.random.PRNGKey(202)
@@ -923,7 +1372,9 @@ def test_strain_basis_consistency_jacobians_and_derivatives(num_segments: int):
 
     # Body-frame (J, Jd)
     for s in s_points:
-        J_small, Jd_small = reduced.jacobian_and_derivative_bodyframe(q_small, qd_small, s)
+        J_small, Jd_small = reduced.jacobian_and_derivative_bodyframe(
+            q_small, qd_small, s
+        )
         J_full, Jd_full = full.jacobian_and_derivative_bodyframe(q_full, qd_full, s)
         assert J_small.shape == (6, n_small_act)
         assert Jd_small.shape == (6, n_small_act)
@@ -945,6 +1396,22 @@ def test_strain_basis_consistency_jacobians_and_derivatives(num_segments: int):
         assert_allclose(J_full @ B, J_small, rtol=RTOL, atol=ATOL)
         assert_allclose(Jd_full @ B, Jd_small, rtol=RTOL, atol=ATOL)
 
+    # Tips inertial-frame Jacobian
+    Ji_tips_small = reduced.jacobian_tips(q_small)
+    Ji_tips_full = full.jacobian_tips(q_full)
+    assert Ji_tips_small.shape == (num_segments, 6, n_small_act)
+    assert Ji_tips_full.shape == (
+        num_segments,
+        6,
+        int(full.num_active_strains.item()),
+    )
+    assert_allclose(
+        jnp.einsum("ijk,kl->ijl", Ji_tips_full, B),
+        Ji_tips_small,
+        rtol=RTOL,
+        atol=ATOL,
+    )
+
     # Batched body-frame Jacobian (internal helper, returns full-strain size)
     Jb_batch_small = reduced._J_local_batched(q_small, s_points)
     Jb_batch_full = full._J_local_batched(q_full, s_points)
@@ -960,7 +1427,9 @@ def test_strain_basis_consistency_jacobians_and_derivatives(num_segments: int):
     assert_allclose(Jb_tips_full, Jb_tips_small, rtol=RTOL, atol=ATOL)
 
     # Batched body-frame (J, Jd) internal helper (full-strain size)
-    Jb_batch_small, Jbd_batch_small = reduced._J_Jd_local_batched(q_small, qd_small, s_points)
+    Jb_batch_small, Jbd_batch_small = reduced._J_Jd_local_batched(
+        q_small, qd_small, s_points
+    )
     Jb_batch_full, Jbd_batch_full = full._J_Jd_local_batched(q_full, qd_full, s_points)
     assert Jb_batch_small.shape == (s_points.shape[0], 6, n_full_strains)
     assert Jbd_batch_small.shape == (s_points.shape[0], 6, n_full_strains)
@@ -982,7 +1451,9 @@ def test_strain_basis_consistency_jacobians_and_derivatives(num_segments: int):
 
 @pytest.mark.parametrize("num_segments", [1, 2])
 def test_strain_basis_consistency_dynamics_and_forces(num_segments: int):
-    selector_per_segment = jnp.array([False, False, True, True, False, False], dtype=bool)
+    selector_per_segment = jnp.array(
+        [False, False, True, True, False, False], dtype=bool
+    )
     full, reduced, B = _make_full_and_reduced_pcs(num_segments, selector_per_segment)
 
     key = jax.random.PRNGKey(303)
@@ -1038,7 +1509,10 @@ def test_strain_basis_consistency_dynamics_and_forces(num_segments: int):
     # Actuation
     A_full = full.actuation_matrix(q_full)
     A_small = reduced.actuation_matrix(q_small)
-    assert A_full.shape == (int(full.num_active_strains.item()), int(full.num_actuators))
+    assert A_full.shape == (
+        int(full.num_active_strains.item()),
+        int(full.num_actuators),
+    )
     assert A_small.shape == (n_small_act, int(reduced.num_actuators))
     # Expect A_small = B^T A_full B = I
     assert_allclose(A_small, B.T @ A_full @ B, rtol=RTOL, atol=ATOL)
@@ -1084,7 +1558,11 @@ def test_strain_basis_consistency_dynamics_and_forces(num_segments: int):
     tau_el_full = full.elastic_force(q_full)
     qdd_full_expected = jnp.linalg.solve(
         B_full_full,
-        tau_u_full - C_full_full @ qd_full - G_full_full - tau_el_full - D_full_full @ qd_full,
+        tau_u_full
+        - C_full_full @ qd_full
+        - G_full_full
+        - tau_el_full
+        - D_full_full @ qd_full,
     )
     assert_allclose(qdd_full_out, qdd_full_expected, rtol=RTOL, atol=ATOL)
 
@@ -1158,8 +1636,11 @@ def test_forward_mode_automatic_differentiability_at_zero_configuration(
     assert not jnp.isnan(dE_dqd).any(), "dE/dqd contains NaN!"
 
 
-def test_reverse_mode_automatic_differentiability_at_zero_configuration() -> None:
-    model, _ = make_pcs(num_segments=2, total_length=PCS_TOTAL_LENGTH)
+@pytest.mark.parametrize("num_segments", [1, 2, 3])
+def test_reverse_mode_automatic_differentiability_at_zero_configuration(
+    num_segments: int,
+) -> None:
+    model, _ = make_pcs(num_segments=num_segments, total_length=PCS_TOTAL_LENGTH)
     dof = int(model.num_active_strains.item())
     # initialize zero state
     q = jnp.zeros((dof,), dtype=jnp.float64)
