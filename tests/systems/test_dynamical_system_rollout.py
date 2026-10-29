@@ -1,19 +1,20 @@
 import equinox as eqx
 import jax
 from jax import numpy as jnp
+from system_param_builders import pendulum_params
 
 from soromox.systems import Pendulum, SystemState
 
 
 def _pendulum_params():
     # Gravity set to zero so the zero configuration is an equilibrium for zero actuation.
-    return {
-        "L": jnp.array([0.5, 0.3]),
-        "Lc": jnp.array([0.25, 0.15]),
-        "m": jnp.array([1.0, 0.5]),
-        "I": jnp.array([0.1, 0.05]),
-        "g": jnp.array([0.0, 0.0]),
-    }
+    return pendulum_params(
+        length=jnp.array([0.5, 0.3]),
+        center_of_mass_length=jnp.array([0.25, 0.15]),
+        mass=jnp.array([1.0, 0.5]),
+        moment_inertia=jnp.array([0.1, 0.05]),
+        gravity=jnp.array([0.0, 0.0]),
+    )
 
 
 class PIDController(eqx.Module):
@@ -69,6 +70,89 @@ class _ConstantStateDotEnvironment(eqx.Module):
     def __call__(self, state: SystemState):
         q_len = state.y.shape[0] // 2
         return jnp.zeros((q_len,)), jnp.array(0.0)
+
+
+def test_compute_save_times_ends_exactly_at_t1_without_overshooting():
+    divisible = Pendulum._compute_save_times(
+        t0=0.0, t1=0.1, solver_dt=0.001, save_dt=0.05
+    )
+    nondivisible = Pendulum._compute_save_times(
+        t0=0.0, t1=0.11, solver_dt=0.001, save_dt=0.05
+    )
+
+    assert jnp.array_equal(divisible, jnp.array([0.0, 0.05, 0.1]))
+    assert jnp.array_equal(nondivisible, jnp.array([0.0, 0.05, 0.1, 0.11]))
+    assert jnp.all(divisible <= 0.1)
+    assert jnp.all(nondivisible <= 0.11)
+
+
+def test_continuous_rollouts_are_jittable_with_explicit_save_times():
+    robot = Pendulum(_pendulum_params())
+    save_ts = jnp.array([0.0, 0.001, 0.002])
+    controller = ZeroController(num_actuators=robot.num_actuators)
+
+    def run(t0: jnp.ndarray, y0: jnp.ndarray):
+        initial_state = SystemState(t=t0, y=y0, u=jnp.zeros((robot.num_actuators,)))
+        open_loop = robot.rollout_to(
+            initial_state=initial_state,
+            t1=save_ts[-1],
+            solver_dt=1e-3,
+            save_dt=None,
+            save_ts=save_ts,
+        )
+        closed_loop = robot.rollout_closed_loop_to(
+            initial_state=initial_state,
+            controller=controller,
+            t1=save_ts[-1],
+            solver_dt=1e-3,
+            save_dt=None,
+            save_ts=save_ts,
+        )
+        return open_loop, closed_loop
+
+    y0 = jnp.zeros((2 * robot.num_internal_dofs,))
+    open_loop, closed_loop = jax.jit(run)(jnp.array(0.0), y0)
+
+    assert jnp.array_equal(open_loop.t, save_ts)
+    assert jnp.array_equal(closed_loop.t, save_ts)
+    assert jnp.all(jnp.isfinite(open_loop.y))
+    assert jnp.all(jnp.isfinite(closed_loop.y))
+
+
+def test_continuous_rollouts_are_vmappable_with_explicit_save_times():
+    robot = Pendulum(_pendulum_params())
+    save_ts = jnp.array([0.0, 0.001, 0.002])
+    controller = ZeroController(num_actuators=robot.num_actuators)
+
+    def run(t0: jnp.ndarray, q0: jnp.ndarray):
+        y0 = jnp.concatenate([q0, jnp.zeros_like(q0)])
+        initial_state = SystemState(t=t0, y=y0, u=jnp.zeros_like(q0))
+        open_loop = robot.rollout_to(
+            initial_state=initial_state,
+            t1=save_ts[-1],
+            solver_dt=1e-3,
+            save_dt=None,
+            save_ts=save_ts,
+        )
+        closed_loop = robot.rollout_closed_loop_to(
+            initial_state=initial_state,
+            controller=controller,
+            t1=save_ts[-1],
+            solver_dt=1e-3,
+            save_dt=None,
+            save_ts=save_ts,
+        )
+        return open_loop.y, closed_loop.y
+
+    t0s = jnp.zeros((3,))
+    q0s = jnp.array([[0.0, 0.0], [0.1, -0.1], [-0.2, 0.05]])
+    open_loop_ys, closed_loop_ys = jax.jit(jax.vmap(run))(t0s, q0s)
+
+    expected_shape = (q0s.shape[0], save_ts.shape[0], 2 * robot.num_internal_dofs)
+    assert open_loop_ys.shape == expected_shape
+    assert closed_loop_ys.shape == expected_shape
+    assert jnp.all(jnp.isfinite(open_loop_ys))
+    assert jnp.all(jnp.isfinite(closed_loop_ys))
 
 
 def test_rollout_to_keeps_equilibrium():

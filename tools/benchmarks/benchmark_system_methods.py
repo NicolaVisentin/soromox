@@ -2,8 +2,8 @@
 
 """Benchmark the core dynamics routines for Soromox soft robot systems.
 
-This script measures both the ahead-of-time JIT compilation cost and the steady-state
-execution time (after compilation) for selected systems and core methods. It supports
+This script measures both first-call JIT compilation cost and steady-state
+execution time after compilation for selected systems and core methods. It supports
 benchmarking articulated, Pendulum, PlanarPCS, PCS, and GVS implementations over a sweep
 of link or segment counts, and can optionally visualise the results.
 """
@@ -11,7 +11,10 @@ of link or segment counts, and can optionally visualise the results.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import os
+import statistics
 import sys
 import time
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
@@ -21,6 +24,21 @@ from typing import Any
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+
+def _configure_device_before_jax_import(argv: Sequence[str]) -> str:
+    """Apply an explicit CLI device choice before JAX is imported."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--device", choices=("auto", "cpu", "gpu"), default="auto")
+    args, _ = parser.parse_known_args(argv)
+    if args.device == "cpu":
+        os.environ["JAX_PLATFORMS"] = "cpu"
+    elif args.device == "gpu":
+        os.environ["JAX_PLATFORMS"] = "cuda"
+    return str(args.device)
+
+
+_EARLY_DEVICE_CHOICE = _configure_device_before_jax_import(sys.argv[1:])
 
 try:
     import jax
@@ -37,19 +55,58 @@ import matplotlib.pyplot as plt
 
 from soromox.systems import SystemState
 from tools.benchmarks._benchmark_common import (
+    add_backend_arg,
     add_gauss_point_args,
     add_integration_args,
     add_system_selection_args,
+    benchmark_environment_metadata,
     block_until_ready,
     build_system_with_gauss_points,
     gauss_point_sweep_values,
     get_system_registry,
     normalize_gauss_point_values,
+    normalize_system_names,
+    resolve_execution_backend,
     system_gauss_point_metadata,
 )
 
 Array = jax.Array
 Tree = Any
+_DIRECT_BACKEND_AWARE_METHODS = frozenset(
+    {
+        "dynamics_terms",
+        "forward_dynamics",
+        "forward_kinematics",
+        "forward_kinematics_abscissa_batched",
+        "jacobian_inertialframe",
+        "jacobian_inertialframe_abscissa_batched",
+        "forward_kinematics_and_jacobian_inertialframe",
+        "forward_kinematics_and_jacobian_inertialframe_abscissa_batched",
+    }
+)
+
+
+def _active_cpu_affinity() -> str | None:
+    """Return the process CPU affinity as a compact, reproducible string."""
+    if not hasattr(os, "sched_getaffinity"):
+        return None
+    cpus = sorted(os.sched_getaffinity(0))
+    ranges: list[str] = []
+    range_start = range_end = cpus[0]
+    for cpu in cpus[1:]:
+        if cpu == range_end + 1:
+            range_end = cpu
+            continue
+        ranges.append(
+            str(range_start)
+            if range_start == range_end
+            else f"{range_start}-{range_end}"
+        )
+        range_start = range_end = cpu
+    ranges.append(
+        str(range_start) if range_start == range_end else f"{range_start}-{range_end}"
+    )
+    return ";".join(ranges)
 
 
 @dataclass
@@ -60,6 +117,7 @@ class RuntimeConfig:
     solver_dt: float
     save_dt: float
     execution_repeats: int
+    warmup_duration: float
 
 
 @dataclass
@@ -78,17 +136,35 @@ class BenchmarkCase:
 class SystemBenchmark:
     """Groups benchmark cases and helpers for one system type."""
 
-    factory: Callable[[int], Any]
+    factory: Callable[..., Any]
     size_label: str
     build_context: Callable[[Any], MutableMapping[str, Array]]
     cases: Sequence[BenchmarkCase]
-    gauss_factory: Callable[[int, int], Any] | None = None
+    gauss_factory: Callable[..., Any] | None = None
     default_gauss_points: int | None = None
     min_gauss_points: int = 1
+    supports_backend: bool = False
 
     @property
     def supports_gauss_points(self) -> bool:
         return self.gauss_factory is not None
+
+
+def _execution_backend_applies(config: SystemBenchmark, method: str) -> bool:
+    """Return whether backend selection affects a benchmarked method.
+
+    Args:
+        config: System benchmark configuration.
+        method: Public system-method name recorded by the benchmark.
+
+    Returns:
+        ``True`` when the system supports alternate execution backends and the
+        method dispatches through that backend.
+    """
+
+    return config.supports_backend and (
+        method in _DIRECT_BACKEND_AWARE_METHODS or method.startswith("rollout")
+    )
 
 
 def _dense_forward_dynamics(
@@ -109,7 +185,7 @@ def _dense_forward_dynamics(
     if u is None:
         u = jnp.zeros((system.num_actuators,), dtype=y.dtype)
     if tau_ext is None:
-        tau_ext = jnp.zeros((system.num_dofs,), dtype=y.dtype)
+        tau_ext = jnp.zeros((system.num_velocities,), dtype=y.dtype)
 
     M = system.inertia_matrix(q)
     C = system.coriolis_matrix(q, qd)
@@ -131,29 +207,53 @@ def _measure_jitted_call(
     fn: Callable[..., Tree],
     args: tuple[Any, ...],
     repeats: int,
+    warmup_duration: float,
 ) -> tuple[float, float]:
-    """Measure compile (first-call) and averaged execution time for a callable.
+    """Measure compile (first-call) and median warm time for a callable.
 
-    The first invocation is treated as "compile + execute" time. Subsequent invocations
-    (``repeats`` of them) are averaged to estimate the steady-state execution cost.
+    The first invocation is treated as "compile + execute" time. Calls made for
+    ``warmup_duration`` seconds are not measured; they let CPU frequency scaling and
+    the runtime thread pool settle. The median of the subsequent ``repeats``
+    synchronized calls estimates the steady-state execution cost while rejecting
+    scheduler outliers.
     """
 
     if repeats < 1:
         raise ValueError("execution repeats must be at least 1")
+    if warmup_duration < 0.0:
+        raise ValueError("warmup duration must be non-negative")
+
+    # JIT a closure around the benchmark callable instead of jitting bound
+    # methods directly. Bound Equinox methods carry ``self`` as part of the
+    # callable object, and JAX may try to hash the module if the bound method is
+    # passed straight to ``jax.jit``.
+    static_argnums = tuple(
+        index
+        for index, arg in enumerate(args)
+        if arg is None or isinstance(arg, (bool, int, float, str))
+    )
+    jitted_fn = jax.jit(
+        lambda *call_args: fn(*call_args), static_argnums=static_argnums
+    )
 
     start = time.perf_counter()
-    first = fn(*args)
+    first = jitted_fn(*args)
     block_until_ready(first)
     first_time = time.perf_counter() - start
+
+    warmup_deadline = time.perf_counter() + warmup_duration
+    while time.perf_counter() < warmup_deadline:
+        warmup_out = jitted_fn(*args)
+        block_until_ready(warmup_out)
 
     exec_times: list[float] = []
     for _ in range(repeats):
         loop_start = time.perf_counter()
-        out = fn(*args)
+        out = jitted_fn(*args)
         block_until_ready(out)
         exec_times.append(time.perf_counter() - loop_start)
 
-    exec_time = sum(exec_times) / len(exec_times)
+    exec_time = statistics.median(exec_times)
     compile_time = max(0.0, first_time - exec_time)
     return compile_time, exec_time
 
@@ -172,10 +272,10 @@ def _build_system_registry() -> Mapping[str, SystemBenchmark]:
             builder=lambda sys, ctx, _: (sys.jacobians_tips, (ctx["q"],)),
         ),
         BenchmarkCase(
-            name="jacobian_and_derivative",
-            description="Tip Jacobians and their derivatives",
+            name="jacobian_and_time_derivative",
+            description="Tip Jacobians and their time derivatives",
             builder=lambda sys, ctx, _: (
-                sys.jacobians_and_derivatives_tips,
+                sys.jacobian_and_time_derivatives_tips,
                 (ctx["q"], ctx["qd"]),
             ),
         ),
@@ -206,9 +306,9 @@ def _build_system_registry() -> Mapping[str, SystemBenchmark]:
                     ctx["qd"],
                     ctx["u"],
                     ctx["tau_ext"],
-                    jnp.array(0.0),
-                    jnp.array(runtime.duration),
-                    jnp.array(runtime.solver_dt),
+                    0.0,
+                    runtime.duration,
+                    runtime.solver_dt,
                     runtime.save_dt,
                 ),
             ),
@@ -227,10 +327,10 @@ def _build_system_registry() -> Mapping[str, SystemBenchmark]:
             builder=lambda sys, ctx, _: (sys.jacobians_tips, (ctx["q"],)),
         ),
         BenchmarkCase(
-            name="jacobian_and_derivative",
-            description="Tip Jacobians and their derivatives",
+            name="jacobian_and_time_derivative",
+            description="Tip Jacobians and their time derivatives",
             builder=lambda sys, ctx, _: (
-                sys.jacobians_and_derivatives_tips,
+                sys.jacobian_and_time_derivatives_tips,
                 (ctx["q"], ctx["qd"]),
             ),
         ),
@@ -270,9 +370,9 @@ def _build_system_registry() -> Mapping[str, SystemBenchmark]:
                     ctx["qd"],
                     ctx["u"],
                     ctx["tau_ext"],
-                    jnp.array(0.0),
-                    jnp.array(runtime.duration),
-                    jnp.array(runtime.solver_dt),
+                    0.0,
+                    runtime.duration,
+                    runtime.solver_dt,
                     runtime.save_dt,
                 ),
             ),
@@ -288,6 +388,50 @@ def _build_system_registry() -> Mapping[str, SystemBenchmark]:
             ),
         ),
         BenchmarkCase(
+            name="forward_kinematics_abscissa_batched",
+            builder=lambda sys, ctx, _: (
+                sys.forward_kinematics_abscissa_batched,
+                (
+                    ctx["q"],
+                    jnp.linspace(0.0, sys.length, 2 * sys.num_segments + 1),
+                ),
+            ),
+        ),
+        BenchmarkCase(
+            name="jacobian_inertialframe",
+            builder=lambda sys, ctx, _: (
+                sys.jacobian_inertialframe,
+                (ctx["q"], ctx["s_tip"]),
+            ),
+        ),
+        BenchmarkCase(
+            name="jacobian_inertialframe_abscissa_batched",
+            builder=lambda sys, ctx, _: (
+                sys.jacobian_inertialframe_abscissa_batched,
+                (
+                    ctx["q"],
+                    jnp.linspace(0.0, sys.length, 2 * sys.num_segments + 1),
+                ),
+            ),
+        ),
+        BenchmarkCase(
+            name="forward_kinematics_and_jacobian_inertialframe",
+            builder=lambda sys, ctx, _: (
+                sys.forward_kinematics_and_jacobian_inertialframe,
+                (ctx["q"], ctx["s_tip"]),
+            ),
+        ),
+        BenchmarkCase(
+            name=("forward_kinematics_and_jacobian_inertialframe_abscissa_batched"),
+            builder=lambda sys, ctx, _: (
+                sys.forward_kinematics_and_jacobian_inertialframe_abscissa_batched,
+                (
+                    ctx["q"],
+                    jnp.linspace(0.0, sys.length, 2 * sys.num_segments + 1),
+                ),
+            ),
+        ),
+        BenchmarkCase(
             name="inverse_kinematics",
             description="Recover strains from planar tip poses",
             builder=lambda sys, ctx, _: (sys.inverse_kinematics, (ctx["chi_tips"],)),
@@ -297,9 +441,9 @@ def _build_system_registry() -> Mapping[str, SystemBenchmark]:
             builder=lambda sys, ctx, _: (sys.jacobian, (ctx["q"], ctx["s_tip"])),
         ),
         BenchmarkCase(
-            name="jacobian_and_derivative",
+            name="jacobian_and_time_derivative",
             builder=lambda sys, ctx, _: (
-                sys.jacobian_and_derivative,
+                sys.jacobian_and_time_derivative,
                 (ctx["q"], ctx["qd"], ctx["s_tip"]),
             ),
         ),
@@ -330,9 +474,9 @@ def _build_system_registry() -> Mapping[str, SystemBenchmark]:
                     ctx["qd"],
                     ctx["u"],
                     ctx["tau_ext"],
-                    jnp.array(0.0),
-                    jnp.array(runtime.duration),
-                    jnp.array(runtime.solver_dt),
+                    0.0,
+                    runtime.duration,
+                    runtime.solver_dt,
                     runtime.save_dt,
                 ),
             ),
@@ -348,9 +492,37 @@ def _build_system_registry() -> Mapping[str, SystemBenchmark]:
             ),
         ),
         BenchmarkCase(
-            name="forward_kinematics_batched",
+            name="forward_kinematics_abscissa_batched",
             builder=lambda sys, ctx, _: (
-                sys.forward_kinematics_batched,
+                sys.forward_kinematics_abscissa_batched,
+                (ctx["q"], ctx["s_points"]),
+            ),
+        ),
+        BenchmarkCase(
+            name="jacobian_inertialframe",
+            builder=lambda sys, ctx, _: (
+                sys.jacobian_inertialframe,
+                (ctx["q"], ctx["s_tip"]),
+            ),
+        ),
+        BenchmarkCase(
+            name="jacobian_inertialframe_abscissa_batched",
+            builder=lambda sys, ctx, _: (
+                sys.jacobian_inertialframe_abscissa_batched,
+                (ctx["q"], ctx["s_points"]),
+            ),
+        ),
+        BenchmarkCase(
+            name="forward_kinematics_and_jacobian_inertialframe",
+            builder=lambda sys, ctx, _: (
+                sys.forward_kinematics_and_jacobian_inertialframe,
+                (ctx["q"], ctx["s_tip"]),
+            ),
+        ),
+        BenchmarkCase(
+            name=("forward_kinematics_and_jacobian_inertialframe_abscissa_batched"),
+            builder=lambda sys, ctx, _: (
+                sys.forward_kinematics_and_jacobian_inertialframe_abscissa_batched,
                 (ctx["q"], ctx["s_points"]),
             ),
         ),
@@ -364,10 +536,18 @@ def _build_system_registry() -> Mapping[str, SystemBenchmark]:
             builder=lambda sys, ctx, _: (sys.jacobian, (ctx["q"], ctx["s_tip"])),
         ),
         BenchmarkCase(
-            name="jacobian_and_derivative",
+            name="jacobian_and_time_derivative",
             builder=lambda sys, ctx, _: (
-                sys.jacobian_and_derivative,
+                sys.jacobian_and_time_derivative,
                 (ctx["q"], ctx["qd"], ctx["s_tip"]),
+            ),
+        ),
+        BenchmarkCase(
+            name="dynamics_terms",
+            description="Fused M, C @ qd, and G path",
+            builder=lambda sys, ctx, _: (
+                sys.dynamics_terms,
+                (ctx["q"], ctx["qd"]),
             ),
         ),
         BenchmarkCase(
@@ -397,9 +577,9 @@ def _build_system_registry() -> Mapping[str, SystemBenchmark]:
                     ctx["qd"],
                     ctx["u"],
                     ctx["tau_ext"],
-                    jnp.array(0.0),
-                    jnp.array(runtime.duration),
-                    jnp.array(runtime.solver_dt),
+                    0.0,
+                    runtime.duration,
+                    runtime.solver_dt,
                     runtime.save_dt,
                 ),
             ),
@@ -412,6 +592,43 @@ def _build_system_registry() -> Mapping[str, SystemBenchmark]:
             builder=lambda sys, ctx, _: (
                 sys.forward_kinematics,
                 (ctx["q"], ctx["s_tip"]),
+            ),
+        ),
+        BenchmarkCase(
+            name="forward_kinematics_abscissa_batched",
+            builder=lambda sys, ctx, _: (
+                sys.forward_kinematics_abscissa_batched,
+                (
+                    ctx["q"],
+                    jnp.linspace(0.0, sys.length, 2 * sys.num_segments + 1),
+                ),
+            ),
+        ),
+        BenchmarkCase(
+            name="jacobian_inertialframe_abscissa_batched",
+            builder=lambda sys, ctx, _: (
+                sys.jacobian_inertialframe_abscissa_batched,
+                (
+                    ctx["q"],
+                    jnp.linspace(0.0, sys.length, 2 * sys.num_segments + 1),
+                ),
+            ),
+        ),
+        BenchmarkCase(
+            name="forward_kinematics_and_jacobian_inertialframe",
+            builder=lambda sys, ctx, _: (
+                sys.forward_kinematics_and_jacobian_inertialframe,
+                (ctx["q"], ctx["s_tip"]),
+            ),
+        ),
+        BenchmarkCase(
+            name=("forward_kinematics_and_jacobian_inertialframe_abscissa_batched"),
+            builder=lambda sys, ctx, _: (
+                sys.forward_kinematics_and_jacobian_inertialframe_abscissa_batched,
+                (
+                    ctx["q"],
+                    jnp.linspace(0.0, sys.length, 2 * sys.num_segments + 1),
+                ),
             ),
         ),
         BenchmarkCase(
@@ -429,16 +646,16 @@ def _build_system_registry() -> Mapping[str, SystemBenchmark]:
             ),
         ),
         BenchmarkCase(
-            name="jacobian_and_derivative_bodyframe",
+            name="jacobian_and_time_derivative_bodyframe",
             builder=lambda sys, ctx, _: (
-                sys.jacobian_and_derivative_bodyframe,
+                sys.jacobian_and_time_derivative_bodyframe,
                 (ctx["q"], ctx["qd"], ctx["s_tip"]),
             ),
         ),
         BenchmarkCase(
-            name="jacobian_and_derivative_inertialframe",
+            name="jacobian_and_time_derivative_inertialframe",
             builder=lambda sys, ctx, _: (
-                sys.jacobian_and_derivative_inertialframe,
+                sys.jacobian_and_time_derivative_inertialframe,
                 (ctx["q"], ctx["qd"], ctx["s_tip"]),
             ),
         ),
@@ -453,6 +670,14 @@ def _build_system_registry() -> Mapping[str, SystemBenchmark]:
         BenchmarkCase(
             name="gravitational_force",
             builder=lambda sys, ctx, _: (sys.gravitational_force, (ctx["q"],)),
+        ),
+        BenchmarkCase(
+            name="dynamics_terms",
+            description="Fused M, C @ qd, and G path",
+            builder=lambda sys, ctx, _: (
+                sys.dynamics_terms,
+                (ctx["q"], ctx["qd"]),
+            ),
         ),
         BenchmarkCase(
             name="forward_dynamics",
@@ -481,9 +706,9 @@ def _build_system_registry() -> Mapping[str, SystemBenchmark]:
                     ctx["qd"],
                     ctx["u"],
                     ctx["tau_ext"],
-                    jnp.array(0.0),
-                    jnp.array(runtime.duration),
-                    jnp.array(runtime.solver_dt),
+                    0.0,
+                    runtime.duration,
+                    runtime.solver_dt,
                     runtime.save_dt,
                 ),
             ),
@@ -496,12 +721,14 @@ def _build_system_registry() -> Mapping[str, SystemBenchmark]:
             size_label=shared["pendulum"].size_label,
             build_context=shared["pendulum"].build_context,
             cases=pendulum_cases,
+            supports_backend=shared["pendulum"].supports_backend,
         ),
         "articulated_soft_robot": SystemBenchmark(
             factory=shared["articulated_soft_robot"].factory,
             size_label=shared["articulated_soft_robot"].size_label,
             build_context=shared["articulated_soft_robot"].build_context,
             cases=articulated_cases,
+            supports_backend=shared["articulated_soft_robot"].supports_backend,
         ),
         "planar_pcs": SystemBenchmark(
             factory=shared["planar_pcs"].factory,
@@ -511,6 +738,7 @@ def _build_system_registry() -> Mapping[str, SystemBenchmark]:
             gauss_factory=shared["planar_pcs"].gauss_factory,
             default_gauss_points=shared["planar_pcs"].default_gauss_points,
             min_gauss_points=shared["planar_pcs"].min_gauss_points,
+            supports_backend=shared["planar_pcs"].supports_backend,
         ),
         "pcs": SystemBenchmark(
             factory=shared["pcs"].factory,
@@ -520,6 +748,7 @@ def _build_system_registry() -> Mapping[str, SystemBenchmark]:
             gauss_factory=shared["pcs"].gauss_factory,
             default_gauss_points=shared["pcs"].default_gauss_points,
             min_gauss_points=shared["pcs"].min_gauss_points,
+            supports_backend=shared["pcs"].supports_backend,
         ),
         "gvs": SystemBenchmark(
             factory=shared["gvs"].factory,
@@ -529,6 +758,7 @@ def _build_system_registry() -> Mapping[str, SystemBenchmark]:
             gauss_factory=shared["gvs"].gauss_factory,
             default_gauss_points=shared["gvs"].default_gauss_points,
             min_gauss_points=shared["gvs"].min_gauss_points,
+            supports_backend=shared["gvs"].supports_backend,
         ),
     }
 
@@ -632,17 +862,36 @@ def _write_csv(results: Sequence[Mapping[str, Any]], path: Path) -> None:
         "size_value",
         "gauss_points",
         "integration_points",
+        "device",
+        "backend",
+        "resolved_backend",
+        "backend_applies",
+        "timestamp_utc",
+        "git_revision",
+        "git_dirty",
+        "python_version",
+        "soromox_version",
+        "jax_version",
+        "jaxlib_version",
+        "warp_version",
+        "x64_enabled",
+        "device_kind",
+        "device_id",
+        "platform_version",
+        "device_count",
+        "cpu_affinity",
         "jit_compile_time_s",
         "jit_execution_time_s",
         "duration",
         "solver_dt",
         "save_dt",
         "execution_repeats",
+        "warmup_duration",
     ]
-    with path.open("w", encoding="utf-8") as fp:
-        fp.write(",".join(headers) + "\n")
-        for row in results:
-            fp.write(",".join(str(row[key]) for key in headers) + "\n")
+    with path.open("w", encoding="utf-8", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=headers, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(results)
     print(f"Wrote benchmark data to {path}")
 
 
@@ -652,6 +901,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         description="Benchmark Soromox system implementations"
     )
     add_system_selection_args(parser, registry, default_segment_counts=[1, 2, 4, 8])
+    add_backend_arg(parser)
     add_gauss_point_args(parser)
     add_integration_args(parser)
     # Collect all unique method names across all systems
@@ -667,10 +917,25 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "gpu"),
+        default="auto",
+        help="JAX device to select before import (default: automatic selection)",
+    )
+    parser.add_argument(
         "--execution-repeats",
         type=int,
         default=3,
-        help="Number of post-compilation executions to average",
+        help="Number of synchronized post-warmup executions to measure",
+    )
+    parser.add_argument(
+        "--warmup-duration",
+        type=float,
+        default=0.0,
+        help=(
+            "Seconds of synchronized unmeasured execution before timing each "
+            "compiled case (useful for stabilizing CPU frequency)"
+        ),
     )
     parser.add_argument(
         "--json",
@@ -698,6 +963,14 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Display the plot window after benchmarking",
     )
     args = parser.parse_args(argv)
+    try:
+        args.systems = normalize_system_names(args.systems, registry)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.execution_repeats < 1:
+        parser.error("--execution-repeats must be >= 1.")
+    if args.warmup_duration < 0.0:
+        parser.error("--warmup-duration must be >= 0.")
     if args.gauss_points is not None:
         if any(value < 1 for value in args.gauss_points):
             parser.error("All --gauss-points entries must be >= 1.")
@@ -707,12 +980,28 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.device != _EARLY_DEVICE_CHOICE:
+        raise RuntimeError(
+            "The --device choice must be present on the process command line so it "
+            "can be applied before JAX is imported."
+        )
+    active_device = jax.default_backend()
+    if args.device == "cpu" and active_device != "cpu":
+        raise RuntimeError(f"Requested CPU but JAX selected {active_device!r}.")
+    if args.device == "gpu" and active_device == "cpu":
+        raise RuntimeError("Requested GPU but JAX selected the CPU backend.")
+    print(f"JAX device: {active_device}")
+    environment_metadata = benchmark_environment_metadata(jax.devices()[0])
+    active_cpu_affinity = _active_cpu_affinity()
+    if active_cpu_affinity is not None:
+        print(f"CPU affinity: {active_cpu_affinity}")
 
     runtime = RuntimeConfig(
         duration=args.duration,
         solver_dt=args.solver_dt,
         save_dt=max(0.0, args.save_dt),
         execution_repeats=args.execution_repeats,
+        warmup_duration=args.warmup_duration,
     )
 
     registry = _build_system_registry()
@@ -736,7 +1025,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         for size in args.segment_counts:
             for requested_gauss_points in gauss_values:
                 system = build_system_with_gauss_points(
-                    system_cfg, size, requested_gauss_points
+                    system_cfg,
+                    size,
+                    requested_gauss_points,
+                    backend=args.backend,
+                )
+                resolved_backend = resolve_execution_backend(
+                    system, platform=active_device
                 )
                 gauss_points, integration_points = system_gauss_point_metadata(system)
                 gauss_note = ""
@@ -748,21 +1043,22 @@ def main(argv: Sequence[str] | None = None) -> int:
 
                 print(
                     f"\n=== Benchmarking {system_name} with "
-                    f"{system_cfg.size_label}={size}{gauss_note} ==="
+                    f"{system_cfg.size_label}={size}{gauss_note}, "
+                    f"backend={resolved_backend} ==="
                 )
                 ctx = system_cfg.build_context(system)
                 for case in cases_to_run:
                     fn, call_args = case.builder(system, ctx, runtime)
                     print(f"  -> {case.name} ...", end=" ", flush=True)
                     compile_time, exec_time = _measure_jitted_call(
-                        fn, call_args, runtime.execution_repeats
+                        fn,
+                        call_args,
+                        runtime.execution_repeats,
+                        runtime.warmup_duration,
                     )
 
                     per_point_note = ""
-                    if (
-                        case.name == "forward_kinematics_batched"
-                        and len(call_args) >= 2
-                    ):
+                    if case.name.endswith("_abscissa_batched") and len(call_args) >= 2:
                         s_arg = call_args[1]
                         num_points = None
                         if hasattr(s_arg, "shape") and s_arg.shape:
@@ -789,12 +1085,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                             "size_value": size,
                             "gauss_points": gauss_points,
                             "integration_points": integration_points,
+                            "device": active_device,
+                            "backend": args.backend,
+                            "resolved_backend": resolved_backend,
+                            "backend_applies": _execution_backend_applies(
+                                system_cfg, case.name
+                            ),
+                            **environment_metadata,
+                            "cpu_affinity": active_cpu_affinity,
                             "jit_compile_time_s": compile_time,
                             "jit_execution_time_s": exec_time,
                             "duration": runtime.duration,
                             "solver_dt": runtime.solver_dt,
                             "save_dt": runtime.save_dt,
                             "execution_repeats": runtime.execution_repeats,
+                            "warmup_duration": runtime.warmup_duration,
                         }
                     )
 

@@ -1,0 +1,1476 @@
+"""Tests for the generic Viser soft-robot renderer."""
+
+from contextlib import contextmanager
+from unittest.mock import Mock
+
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from numpy.testing import assert_allclose, assert_array_equal
+from PIL import Image
+
+from soromox.rendering.actuators import ActuatorVisualLayer
+from soromox.rendering.base_geometry import base_plate_mesh
+from soromox.rendering.config import (
+    GeometryConfig,
+    GroundPlaneConfig,
+    RendererConfig,
+    RenderOutputConfig,
+    SceneConfig,
+)
+from soromox.rendering.config.camera import CameraConfig
+from soromox.systems.components import CrossSectionGeometry
+from soromox.utils.geometry import poses
+
+
+class DummySpatialRobot:
+    is_planar = False
+    floating_base = False
+    length = jnp.array(1.0)
+    segment_length = jnp.array([1.0])
+    num_coordinates = 0
+
+    def __init__(self, base_pose: jnp.ndarray):
+        self.fixed_base_pose = jnp.asarray(base_pose)
+        self.base_transform = poses.quaternion_pose_to_transform(self.fixed_base_pose)
+
+    def forward_kinematics_abscissa_batched(self, q, s_ps):
+        transforms = jnp.repeat(self.base_transform[None, :, :], s_ps.shape[0], axis=0)
+        offsets = s_ps[:, None] * self.base_transform[:3, 0]
+        return transforms.at[:, :3, 3].add(offsets)
+
+    def forward_kinematics(self, q, s):
+        return self.forward_kinematics_abscissa_batched(q, jnp.asarray([s]))[0]
+
+    def cross_section_geometry(self, q, s):
+        return (CrossSectionGeometry.CIRCULAR, jnp.array([0.02]), None)
+
+
+class ProfiledSpatialRobot(DummySpatialRobot):
+    def __init__(self, geometry, base_dimensions, tip_dimensions):
+        super().__init__(jnp.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+        self.geometry = geometry
+        self.base_dimensions = jnp.asarray(base_dimensions)
+        self.tip_dimensions = jnp.asarray(tip_dimensions)
+
+    def cross_section_geometry(self, q, s):
+        del q
+        dimensions = self.base_dimensions + s * (
+            self.tip_dimensions - self.base_dimensions
+        )
+        return (self.geometry, dimensions, None)
+
+
+@pytest.mark.parametrize("second_inner", [0.015, 0.01, 0.0])
+def test_hollow_sections_survive_general_viser_build_update_and_interfaces(
+    second_inner,
+):
+    from soromox.rendering.viser_renderer import SceneHandles, ViserRenderer
+
+    class HollowRobot(DummySpatialRobot):
+        segment_length = jnp.array([0.6, 0.4])
+
+        def cross_section_geometry(self, q, s):
+            geometry, outer, _ = super().cross_section_geometry(q, s)
+            inner = jnp.array([jnp.where(s < 0.6, 0.015, second_inner)])
+            return geometry, outer, inner
+
+    renderer = ViserRenderer(
+        HollowRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])),
+        auto_start=False,
+        config=RendererConfig(
+            geometry=GeometryConfig(num_points=8, cross_section_resolution=8)
+        ),
+    )
+    assert renderer._cross_section_contours[0].shape == (2, 8, 3)
+    assert renderer._cross_section_contours[-1].shape == (
+        1 if second_inner == 0 else 2,
+        8,
+        3,
+    )
+    curves, frames = map(
+        np.asarray,
+        renderer.compute_backbone_curves_and_frames_batched(
+            jnp.zeros((1, 0)),
+            jnp.zeros((1, 3)),
+        ),
+    )
+    caps = renderer._matching_swept_edge_caps(curves[0], frames[0])
+    assert caps[2][1] == caps[4][0] == (second_inner != 0.015)
+    server = FakeViserActuatorServer()
+    renderer._server = server
+    renderer._scene_handles = SceneHandles()
+    renderer._build_robot_geometry(
+        curves,
+        np.ones((1, 8, 4)),
+        material_frames=frames,
+        base_plate_color=(0.15, 0.15, 0.15),
+    )
+    mesh = server.scene.simple_meshes[0]
+    before, faces = mesh.vertices.copy(), mesh.faces.copy()
+    offset = np.array([0.03, -0.01, 0.02])
+    renderer._update_robot_geometry(curves + offset, frames)
+    assert_allclose(mesh.vertices, before + offset, atol=1e-7)
+    assert_array_equal(mesh.faces, faces)
+    # Three pieces per link; each wall contributes two triangles per edge.
+    loops2 = 1 if second_inner == 0 else 2
+    expected = 3 * 2 * 8 * (2 + loops2) + (8 if loops2 == 1 else 16)
+    if second_inner != 0.015:
+        expected += 16 + (8 if loops2 == 1 else 16)
+    assert len(faces) == expected
+
+
+class DiscontinuousTwoLinkRobot(DummySpatialRobot):
+    segment_length = jnp.array([0.6, 0.4])
+
+    def cross_section_geometry(self, q, s):
+        del q
+        is_first_link = s < 0.6
+        geometry = jnp.where(
+            is_first_link,
+            CrossSectionGeometry.RECTANGULAR,
+            CrossSectionGeometry.CIRCULAR,
+        )
+        dimensions = jnp.where(
+            is_first_link,
+            jnp.array([0.2, 0.4]),
+            jnp.array([0.05, 0.05]),
+        )
+        return (geometry, dimensions, None)
+
+
+class DummyActuatedSpatialRobot(DummySpatialRobot):
+    def actuator_visual_layers(self, q, s_points, *, actuator_inputs=None):
+        del q
+        tendon = jnp.stack(
+            [
+                s_points,
+                jnp.full_like(s_points, 0.1),
+                jnp.zeros_like(s_points),
+            ],
+            axis=1,
+        )[None, ...]
+        muscles = jnp.array(
+            [
+                [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+                [[0.0, 0.2, 0.0], [1.0, 0.2, 0.0]],
+            ]
+        )
+        pressure = (
+            jnp.zeros((2,))
+            if actuator_inputs is None
+            else jnp.asarray(actuator_inputs).reshape((2,))
+        )
+        return (
+            ActuatorVisualLayer(name="sampled_tendon", kind="tendon", points=tendon),
+            ActuatorVisualLayer(
+                name="mckibben_pair",
+                kind="muscle",
+                points=muscles,
+                scalar_fields={"pressure": pressure},
+            ),
+        )
+
+
+class FakeViserCamera:
+    def __init__(self):
+        self.position = None
+        self.look_at = None
+        self.up_direction = None
+        self.fov = None
+        self.render = None
+
+    def get_render(self, *, height, width, transport_format="png"):
+        del height, width
+        return self.render
+
+
+class FakeViserClient:
+    def __init__(self):
+        self.camera = FakeViserCamera()
+
+    def get_render(self, *, height, width, transport_format="png", **pose):
+        self.capture_pose = pose
+        return self.camera.get_render(
+            height=height, width=width, transport_format=transport_format
+        )
+
+
+class FakeViserServer:
+    def __init__(self, clients):
+        self._clients = clients
+        self.on_client_connect_callback = None
+
+    def get_clients(self):
+        return self._clients
+
+    def on_client_connect(self, callback):
+        self.on_client_connect_callback = callback
+        return callback
+
+    def get_port(self):
+        return 8080
+
+
+class FakeViserLineHandle:
+    def __init__(self, *, name, points, colors, line_width):
+        self.name = name
+        self.points = points
+        self.colors = colors
+        self.line_width = line_width
+        self.remove_count = 0
+
+    def remove(self):
+        self.remove_count += 1
+
+
+class FakeViserGeometryHandle:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+        self.remove_count = 0
+
+    def remove(self):
+        self.remove_count += 1
+
+
+class FakeViserScene:
+    def __init__(self):
+        self.up_direction = None
+        self.line_segments = []
+        self.icospheres = []
+        self.trimeshes = []
+        self.simple_meshes = []
+        self.batched_meshes = []
+        self.grids = []
+
+    def add_frame(self, name, **kwargs):
+        return FakeViserGeometryHandle(name=name, **kwargs)
+
+    def set_up_direction(self, direction):
+        self.up_direction = direction
+
+    def add_grid(self, **kwargs):
+        handle = FakeViserGeometryHandle(**kwargs)
+        self.grids.append(handle)
+        return handle
+
+    def add_line_segments(self, *, name, points, colors, line_width):
+        handle = FakeViserLineHandle(
+            name=name,
+            points=points,
+            colors=colors,
+            line_width=line_width,
+        )
+        self.line_segments.append(handle)
+        return handle
+
+    def add_icosphere(self, **kwargs):
+        handle = FakeViserGeometryHandle(**kwargs)
+        self.icospheres.append(handle)
+        return handle
+
+    def add_mesh_trimesh(self, **kwargs):
+        handle = FakeViserGeometryHandle(**kwargs)
+        self.trimeshes.append(handle)
+        return handle
+
+    def add_mesh_simple(self, **kwargs):
+        handle = FakeViserGeometryHandle(**kwargs)
+        self.simple_meshes.append(handle)
+        return handle
+
+    def add_batched_meshes_simple(self, **kwargs):
+        handle = FakeViserGeometryHandle(**kwargs)
+        self.batched_meshes.append(handle)
+        return handle
+
+
+class FakeViserActuatorServer:
+    def __init__(self):
+        self.scene = FakeViserScene()
+        self.atomic_calls = 0
+
+    @contextmanager
+    def atomic(self):
+        self.atomic_calls += 1
+        yield
+
+    def get_port(self):
+        return 8080
+
+
+@pytest.mark.parametrize("from_static", [False, True])
+def test_live_mode_initializes_editable_geometry_and_camera(from_static):
+    from soromox.rendering.viser_renderer import SceneHandles, ViserRenderer
+
+    class MovingRobot(DummySpatialRobot):
+        def forward_kinematics_abscissa_batched(self, q, s_points):
+            transforms = super().forward_kinematics_abscissa_batched(q, s_points)
+            return transforms.at[:, 1, 3].add(q[0] * s_points)
+
+    robot = MovingRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+    renderer = ViserRenderer(
+        robot,
+        auto_start=False,
+        config=RendererConfig(
+            geometry=GeometryConfig(num_points=4),
+            scene=SceneConfig(ground=GroundPlaneConfig(visible=False)),
+        ),
+    )
+    renderer._server = FakeViserActuatorServer()
+    renderer._scene_handles = SceneHandles()
+    renderer._setup_camera = Mock()
+    if from_static:
+        renderer._static_scene = True
+        curves, frames = map(
+            np.asarray,
+            renderer.compute_backbone_curves_and_frames_batched(
+                jnp.zeros((1, 1)), jnp.zeros((1, 3))
+            ),
+        )
+        renderer._build_robot_geometry(
+            curves,
+            np.ones((1, 4, 4)),
+            material_frames=frames,
+            base_plate_color=(0.5, 0.5, 0.5),
+        )
+        assert not renderer._server.scene.simple_meshes
+
+    live = renderer.start_live_mode()
+    try:
+        live.push_state(np.zeros(1))
+        handle = renderer._scene_handles.backbone_points[0][0]
+        assert handle in renderer._server.scene.simple_meshes
+        initial_vertices = handle.vertices.copy()
+        live.push_state(np.array([0.25]))
+        assert renderer._scene_handles.backbone_points[0][0] is handle
+        assert not np.allclose(handle.vertices, initial_vertices)
+        renderer._setup_camera.assert_called_once()
+    finally:
+        live.stop()
+
+
+@pytest.mark.parametrize("backbone_style", ["swept", "discrete"])
+def test_live_batch_resize_removes_previous_robot_meshes(backbone_style):
+    from soromox.rendering.viser_renderer import SceneHandles, ViserRenderer
+
+    renderer = ViserRenderer(
+        DummySpatialRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])),
+        auto_start=False,
+        config=RendererConfig(
+            geometry=GeometryConfig(num_points=4, backbone_style=backbone_style),
+            scene=SceneConfig(ground=GroundPlaneConfig(visible=False)),
+        ),
+    )
+    renderer._server = FakeViserActuatorServer()
+    renderer._scene_handles = SceneHandles()
+    renderer._setup_camera = Mock()
+    live = renderer.start_live_mode()
+    try:
+        live.push_state(np.zeros((2, 0)))
+        previous = [
+            handle
+            for group in renderer._scene_handles.backbone_points
+            for handle in group
+        ] + renderer._scene_handles.base_plates
+        live.push_state(np.zeros((1, 0)))
+        assert renderer._scene_handles.num_robots == 1
+        assert all(handle.remove_count == 1 for handle in previous)
+    finally:
+        live.stop()
+
+
+def test_viser_server_uses_world_positive_z_as_scene_up(monkeypatch):
+    import soromox.rendering.viser_renderer as viser_module
+
+    class StartableFakeServer(FakeViserActuatorServer):
+        def __init__(self, *, host, port):
+            super().__init__()
+            self.host = host
+            self.port = port
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(viser_module.viser, "ViserServer", StartableFakeServer)
+    robot = DummySpatialRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+    renderer = viser_module.ViserRenderer(robot, auto_start=False)
+
+    renderer.start()
+    try:
+        assert renderer.server.scene.up_direction == "+z"
+    finally:
+        renderer.stop()
+
+
+class FakeViserGuiHandle:
+    def __init__(self, *, value=None, icon=None):
+        self.value = value
+        self.icon = icon
+        self.update_callback = None
+        self.click_callback = None
+
+    def on_update(self, callback):
+        self.update_callback = callback
+        return callback
+
+    def on_click(self, callback):
+        self.click_callback = callback
+        return callback
+
+    def trigger_update(self, value):
+        self.value = value
+        event = type("FakeViserGuiEvent", (), {"target": self})()
+        self.update_callback(event)
+
+
+class FakeViserGuiFolder:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+
+class FakeViserGui:
+    def __init__(self):
+        self.handles = {}
+
+    def add_folder(self, name):
+        del name
+        return FakeViserGuiFolder()
+
+    def add_button(self, name, *, icon):
+        handle = FakeViserGuiHandle(icon=icon)
+        self.handles[name] = handle
+        return handle
+
+    def add_slider(self, name, *, min, max, step, initial_value):
+        del min, max, step
+        handle = FakeViserGuiHandle(value=initial_value)
+        self.handles[name] = handle
+        return handle
+
+    def add_checkbox(self, name, *, initial_value):
+        handle = FakeViserGuiHandle(value=initial_value)
+        self.handles[name] = handle
+        return handle
+
+    def add_text(self, name, *, initial_value, disabled):
+        del disabled
+        handle = FakeViserGuiHandle(value=initial_value)
+        self.handles[name] = handle
+        return handle
+
+
+class FakeViserPlaybackServer:
+    def __init__(self):
+        self.gui = FakeViserGui()
+
+
+def test_viser_camera_uses_shared_up_and_radian_fov():
+    from soromox.rendering.viser_renderer import ViserRenderer
+
+    robot = DummySpatialRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+    renderer = ViserRenderer(robot, auto_start=False)
+    client = FakeViserClient()
+    server = FakeViserServer({"client": client})
+    renderer._server = server
+    curves = np.array([[[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]]])
+
+    renderer._setup_camera(
+        curves,
+        camera_config=CameraConfig(
+            fov=60.0,
+            distance_factor=1.0,
+            position_offset=(1.0, 0.0, 0.0),
+            up=(0.0, 0.0, 1.0),
+        ),
+    )
+
+    assert_allclose(client.camera.position, np.array([1.0, 0.5, 0.0]), atol=1e-12)
+    assert_allclose(client.camera.look_at, np.array([0.0, 0.5, 0.0]), atol=1e-12)
+    assert_allclose(client.camera.up_direction, np.array([0.0, 0.0, 1.0]), atol=1e-12)
+    assert_allclose(client.camera.fov, np.pi / 3.0, atol=1e-12)
+    assert server.on_client_connect_callback is not None
+
+
+def test_viser_scene_up_does_not_override_custom_camera_up():
+    from soromox.rendering.viser_renderer import ViserRenderer
+
+    robot = DummySpatialRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+    renderer = ViserRenderer(robot, auto_start=False)
+    connected_client = FakeViserClient()
+    server = FakeViserServer({})
+    renderer._server = server
+    curves = np.array([[[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]]])
+    config = CameraConfig(
+        fov=45.0,
+        position=(1.0, -2.0, 3.0),
+        look_at=(0.0, 0.5, 0.0),
+        up=(0.0, 0.0, -1.0),
+    )
+
+    renderer._setup_camera(curves, camera_config=config)
+    assert server.on_client_connect_callback is not None
+    server.on_client_connect_callback(connected_client)
+
+    assert_allclose(connected_client.camera.position, config.position, atol=1e-12)
+    assert_allclose(connected_client.camera.look_at, config.look_at, atol=1e-12)
+    assert_allclose(
+        connected_client.camera.up_direction,
+        np.array([0.0, 0.0, -1.0]),
+        atol=1e-12,
+    )
+    assert_allclose(connected_client.camera.fov, np.pi / 4.0, atol=1e-12)
+
+
+def test_viser_camera_accepts_full_trajectory_curves_for_bounds():
+    from soromox.rendering.viser_renderer import ViserRenderer
+
+    robot = DummySpatialRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+    renderer = ViserRenderer(robot, auto_start=False)
+    client = FakeViserClient()
+    renderer._server = FakeViserServer({"client": client})
+    curves = np.array(
+        [
+            [
+                [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                [[2.0, 0.0, 0.0], [2.0, 1.0, 0.0]],
+            ]
+        ]
+    )
+
+    renderer._setup_camera(
+        curves,
+        camera_config=CameraConfig(
+            distance_factor=1.0, position_offset=(1.0, 0.0, 0.0)
+        ),
+    )
+
+    assert_allclose(client.camera.look_at, np.array([1.0, 0.5, 0.0]), atol=1e-12)
+    assert_allclose(client.camera.position, np.array([3.0, 0.5, 0.0]), atol=1e-12)
+
+
+def test_viser_capture_rejects_missing_frame():
+    from soromox.rendering.viser_renderer import ViserRenderer
+
+    robot = DummySpatialRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+    renderer = ViserRenderer(robot, auto_start=False)
+    client = FakeViserClient()
+    renderer._server = FakeViserServer({"client": client})
+
+    with pytest.raises(RuntimeError, match="did not return a frame"):
+        renderer._capture_viser_frame(client, timeout=0.1)
+
+
+def test_viser_sequence_hooks_and_capture_reuse(monkeypatch, tmp_path):
+    import soromox.rendering.viser_renderer as viser_module
+
+    class HookedRenderer(viser_module.ViserRenderer):
+        def __init__(self, *args, **kwargs):
+            self.events = []
+            self.current_frame = None
+            super().__init__(*args, **kwargs)
+
+        def _after_sequence_scene_built(self):
+            self.events.append(("scene", None))
+
+        def _after_sequence_frame_updated(self, frame_idx):
+            self.current_frame = frame_idx
+            self.events.append(("overlay", frame_idx))
+
+    class FakeWriter:
+        instances = []
+
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+            self.frames = []
+            self.closed = False
+            self.__class__.instances.append(self)
+
+        def write(self, frame):
+            self.frames.append(np.asarray(frame).copy())
+
+        def close(self):
+            self.closed = True
+
+    robot = DummySpatialRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+    renderer = HookedRenderer(
+        robot,
+        auto_start=False,
+        open_browser=False,
+        config=RendererConfig(output=RenderOutputConfig(width=4, height=3)),
+    )
+    client = FakeViserClient()
+    renderer._server = FakeViserServer({"client": client})
+    renderer._running = True
+
+    curves = np.zeros((1, 2, 3), dtype=np.float64)
+    frames = np.broadcast_to(np.eye(3), (1, 2, 3, 3)).copy()
+    renderer.compute_backbone_curves_and_frames_batched = lambda q, offsets: (
+        curves,
+        frames,
+    )
+    renderer.compute_backbone_curves_batched = lambda q, offsets: curves
+    renderer._clear_scene = lambda: None
+    renderer._build_robot_geometry = lambda *args, **kwargs: renderer.events.append(
+        ("robot", 0)
+    )
+    renderer._build_static_spheres = lambda positions, radii, colors: (
+        renderer.events.append(("static", None))
+    )
+    renderer._build_dynamic_spheres = lambda positions, radii, colors: (
+        renderer.events.append(("dynamic", None))
+    )
+    renderer._setup_camera = lambda *args, **kwargs: None
+    renderer._setup_lighting = lambda: None
+    renderer._setup_playback_gui = lambda **kwargs: None
+    renderer._update_playback_gui = lambda state: None
+
+    def update_frame(frame_idx, *args, **kwargs):
+        del args, kwargs
+        renderer.events.append(("robot", frame_idx))
+
+    renderer._update_frame = update_frame
+
+    captured_indices = []
+
+    def capture_frame(client_arg, *, timeout):
+        del timeout
+        captured_indices.append(renderer.current_frame)
+        renderer.events.append(("capture", renderer.current_frame))
+        frame = np.full(
+            (renderer.height, renderer.width, 3),
+            renderer.current_frame,
+            dtype=np.uint8,
+        )
+        return frame, client_arg
+
+    renderer._capture_viser_frame = capture_frame
+    monkeypatch.setattr(viser_module, "FFmpegVideoWriter", FakeWriter)
+
+    snapshot_one = tmp_path / "frame_1.png"
+    snapshot_two = tmp_path / "frame_2.png"
+    renderer.render_sequence(
+        ts=np.array([0.0, 0.001, 0.002]),
+        q_ts=np.zeros((3, 0)),
+        record_path=str(tmp_path / "video.mp4"),
+        record_every_n=2,
+        stop_when_recording_done=True,
+        render_actuators=False,
+        static_spheres_positions=np.zeros((1, 3)),
+        static_spheres_radii=np.array([0.01]),
+        static_spheres_colors=np.array([[0.1, 0.2, 0.3]]),
+        dynamic_spheres_positions=np.zeros((1, 3, 3)),
+        dynamic_spheres_radii=np.array([0.02]),
+        dynamic_spheres_colors=np.array([[0.4, 0.5, 0.6]]),
+        snapshot_paths={np.int64(1): snapshot_one, 2: snapshot_two},
+    )
+
+    assert captured_indices == [0, 1, 2]
+    assert (
+        renderer.events.index(("robot", 0))
+        < renderer.events.index(("scene", None))
+        < renderer.events.index(("overlay", 0))
+        < renderer.events.index(("capture", 0))
+    )
+    for frame_idx in (1, 2):
+        assert (
+            renderer.events.index(("robot", frame_idx))
+            < renderer.events.index(("overlay", frame_idx))
+            < renderer.events.index(("capture", frame_idx))
+        )
+
+    writer = FakeWriter.instances[-1]
+    assert writer.closed
+    assert [int(frame[0, 0, 0]) for frame in writer.frames] == [0, 2]
+    assert int(np.asarray(Image.open(snapshot_one))[0, 0, 0]) == 1
+    assert int(np.asarray(Image.open(snapshot_two))[0, 0, 0]) == 2
+
+
+def test_viser_recording_captures_synchronized_batched_geometry_for_every_frame(
+    monkeypatch, tmp_path
+):
+    import soromox.rendering.viser_renderer as viser_module
+
+    class AnimatingActuatedRobot(DummySpatialRobot):
+        def forward_kinematics_abscissa_batched(self, q, s_points):
+            transforms = jnp.broadcast_to(jnp.eye(4), (s_points.size, 4, 4))
+            positions = jnp.stack((s_points, q[0] * s_points, q[1] * s_points), axis=-1)
+            return transforms.at[:, :3, 3].set(positions)
+
+        def actuator_visual_layers(self, q, s_points, *, actuator_inputs=None):
+            del actuator_inputs
+            points = jnp.stack(
+                (
+                    s_points,
+                    jnp.full_like(s_points, q[0]),
+                    jnp.full_like(s_points, q[1]),
+                ),
+                axis=-1,
+            )[None]
+            return (
+                ActuatorVisualLayer(
+                    name="animated_tendon",
+                    kind="tendon",
+                    points=points,
+                ),
+            )
+
+    class FakeWriter:
+        instances = []
+
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+            self.frames = []
+            self.closed = False
+            self.__class__.instances.append(self)
+
+        def write(self, frame):
+            self.frames.append(np.asarray(frame).copy())
+
+        def close(self):
+            self.closed = True
+
+    robot = AnimatingActuatedRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+    renderer = viser_module.ViserRenderer(
+        robot,
+        auto_start=False,
+        open_browser=False,
+        config=RendererConfig(
+            output=RenderOutputConfig(width=4, height=3),
+            geometry=GeometryConfig(num_points=4, backbone_style="discrete"),
+            scene=SceneConfig(ground=GroundPlaneConfig(visible=False)),
+        ),
+    )
+    server = FakeViserActuatorServer()
+    renderer._server = server
+    renderer._running = True
+    renderer._setup_camera = lambda *args, **kwargs: None
+    renderer._setup_lighting = lambda: None
+    renderer._setup_playback_gui = lambda **kwargs: None
+    renderer._update_playback_gui = lambda state: None
+    renderer._wait_for_recording_client = lambda timeout: object()
+
+    ts = np.array([0.0, 0.001, 0.002, 0.003])
+    q_ts = np.array(
+        [
+            [[0.0, 0.0], [0.1, 0.2], [0.2, 0.4], [0.3, 0.6]],
+            [[0.0, 0.0], [-0.1, 0.3], [-0.2, 0.6], [-0.3, 0.9]],
+        ],
+        dtype=np.float64,
+    )
+    offsets = np.array([[0.0, 0.0, 0.0], [2.0, -1.0, 0.5]])
+    dynamic_trajectories = np.array(
+        [
+            [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.2, 0.0, 0.0], [0.3, 0.0, 0.0]],
+            [[1.0, 0.0, 0.0], [1.0, 0.2, 0.0], [1.0, 0.4, 0.0], [1.0, 0.6, 0.0]],
+        ]
+    )
+    s_points = np.linspace(0.0, 1.0, renderer.num_points)
+    captured_states = []
+
+    def capture_frame(client, *, timeout):
+        del timeout
+        frame_idx = renderer._animation_state.frame_idx
+        backbone_positions = np.stack(
+            [
+                handles[0].batched_positions
+                for handles in renderer._scene_handles.backbone_points
+            ]
+        )
+        actuator_points = renderer._scene_handles.actuator_lines[0].points.copy()
+        dynamic_positions = renderer._scene_handles.dynamic_spheres[
+            0
+        ].batched_positions.copy()
+
+        expected_backbone = []
+        expected_actuators = []
+        for robot_idx in range(2):
+            q = q_ts[robot_idx, frame_idx]
+            expected_backbone.append(
+                np.stack((s_points, q[0] * s_points, q[1] * s_points), axis=-1)
+                + offsets[robot_idx]
+            )
+            curve = (
+                np.stack(
+                    (
+                        s_points,
+                        np.full_like(s_points, q[0]),
+                        np.full_like(s_points, q[1]),
+                    ),
+                    axis=-1,
+                )
+                + offsets[robot_idx]
+            )
+            expected_actuators.append(np.stack((curve[:-1], curve[1:]), axis=1))
+
+        assert_allclose(backbone_positions, np.stack(expected_backbone), atol=1e-7)
+        assert_allclose(
+            actuator_points,
+            np.concatenate(expected_actuators, axis=0),
+            atol=1e-7,
+        )
+        assert_allclose(
+            dynamic_positions,
+            dynamic_trajectories[:, frame_idx],
+            atol=1e-7,
+        )
+        captured_states.append(frame_idx)
+        return (
+            np.full((renderer.height, renderer.width, 3), frame_idx, dtype=np.uint8),
+            client,
+        )
+
+    renderer._capture_viser_frame = capture_frame
+    monkeypatch.setattr(viser_module, "FFmpegVideoWriter", FakeWriter)
+
+    renderer.render_sequence(
+        ts,
+        q_ts,
+        base_offsets=offsets,
+        dynamic_spheres_positions=dynamic_trajectories,
+        dynamic_spheres_radii=np.array([0.02, 0.03]),
+        dynamic_spheres_colors=np.array([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]),
+        record_path=str(tmp_path / "synchronized.mp4"),
+        stop_when_recording_done=True,
+    )
+
+    assert captured_states == [0, 1, 2, 3]
+    writer = FakeWriter.instances[-1]
+    assert writer.closed
+    assert [int(frame[0, 0, 0]) for frame in writer.frames] == [0, 1, 2, 3]
+    assert len(server.scene.batched_meshes) == 3
+    assert len(server.scene.line_segments) == 1
+
+
+@pytest.mark.parametrize(
+    "snapshot_paths, message",
+    [
+        ({-1: "negative.png"}, "within the rendered sequence"),
+        ({3: "past_end.png"}, "within the rendered sequence"),
+        ({1.0: "integral_float.png"}, "must be an integer"),
+        ({1.5: "fractional.png"}, "must be an integer"),
+        ({True: "boolean.png"}, "must be an integer"),
+        ({np.bool_(False): "numpy_boolean.png"}, "must be an integer"),
+        ({0: "not_png.jpg"}, "must be a PNG"),
+        ({0: "same.png", 1: "same.png"}, "must be unique"),
+    ],
+)
+def test_viser_snapshot_paths_are_validated_before_rendering(
+    snapshot_paths,
+    message,
+):
+    from soromox.rendering.viser_renderer import ViserRenderer
+
+    robot = DummySpatialRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+    renderer = ViserRenderer(robot, auto_start=False)
+    renderer._server = FakeViserServer({})
+
+    with pytest.raises(ValueError, match=message):
+        renderer.render_sequence(
+            np.array([0.0, 0.1, 0.2]),
+            np.zeros((3, 0)),
+            snapshot_paths=snapshot_paths,
+            blocking=False,
+        )
+
+
+def test_viser_capture_timeout_is_explicit():
+    from soromox.rendering.viser_renderer import ViserRenderer
+
+    robot = DummySpatialRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+    renderer = ViserRenderer(robot, auto_start=False)
+    client = FakeViserClient()
+    renderer._server = FakeViserServer({"client": client})
+
+    def block_render(*, height, width):
+        del height, width
+        import time
+
+        time.sleep(0.1)
+        return np.zeros((renderer.height, renderer.width, 3), dtype=np.uint8)
+
+    client.camera.get_render = block_render
+    with pytest.raises(RuntimeError, match="Timed out while capturing"):
+        renderer._capture_viser_frame(client, timeout=0.001)
+
+
+def test_viser_discrete_backbone_batches_positions_colors_and_marker_scale():
+    from soromox.rendering.viser_renderer import SceneHandles, ViserRenderer
+
+    robot = DummySpatialRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+    renderer = ViserRenderer(
+        robot,
+        auto_start=False,
+        config=RendererConfig(geometry=GeometryConfig(backbone_style="discrete")),
+    )
+    server = FakeViserActuatorServer()
+    renderer._server = server
+    renderer._scene_handles = SceneHandles()
+    curves = np.array([[[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]]])
+    material_frames = np.broadcast_to(np.eye(3), (1, 2, 3, 3)).copy()
+    point_colors = np.ones((1, 2, 4), dtype=np.float64)
+
+    renderer._build_robot_geometry(
+        curves,
+        point_colors,
+        material_frames=material_frames,
+        base_plate_color=(0.15, 0.15, 0.15),
+    )
+
+    assert server.scene.icospheres == []
+    assert len(server.scene.batched_meshes) == 1
+    handle = server.scene.batched_meshes[0]
+    assert_allclose(handle.batched_positions, curves[0], atol=1e-12)
+    assert_allclose(
+        handle.batched_scales,
+        np.full((2, 3), 0.02),
+        atol=1e-12,
+    )
+    assert_array_equal(handle.batched_colors, np.full((2, 3), 255))
+
+
+def test_viser_discrete_backbone_uses_boxes_for_rectangular_sections():
+    from soromox.rendering.viser_renderer import SceneHandles, ViserRenderer
+
+    robot = DiscontinuousTwoLinkRobot(jnp.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+    renderer = ViserRenderer(
+        robot,
+        auto_start=False,
+        sphere_resolution=1,
+        config=RendererConfig(
+            geometry=GeometryConfig(backbone_style="discrete", num_points=8)
+        ),
+    )
+    server = FakeViserActuatorServer()
+    renderer._server = server
+    renderer._scene_handles = SceneHandles()
+    curves, frames = renderer.compute_backbone_curves_and_frames_batched(
+        jnp.zeros((1, 0)), jnp.zeros((1, 3))
+    )
+
+    renderer._build_robot_geometry(
+        np.asarray(curves),
+        renderer.resolve_backbone_colors(1).per_robot_point_rgba,
+        material_frames=np.asarray(frames),
+        base_plate_color=(0.15, 0.15, 0.15),
+    )
+
+    batches = renderer._scene_handles.discrete_backbone_batches[0]
+    assert len(batches) == 2
+    box_batch = next(batch for batch in batches if "box_markers" in batch.handle.name)
+    sphere_batch = next(
+        batch for batch in batches if "sphere_markers" in batch.handle.name
+    )
+    assert len(box_batch.handle.vertices) == 8
+    assert_allclose(
+        box_batch.handle.batched_scales,
+        np.tile([0.2, 0.4, 0.4], (len(box_batch.point_indices), 1)),
+    )
+    assert_allclose(
+        sphere_batch.handle.batched_scales,
+        np.tile([0.05, 0.05, 0.05], (len(sphere_batch.point_indices), 1)),
+    )
+
+    rotated_frames = np.asarray(frames).copy()
+    rotated_frames[:, :, :, 1:] *= -1.0
+    original_wxyzs = box_batch.handle.batched_wxyzs.copy()
+    renderer._update_robot_geometry(np.asarray(curves), rotated_frames)
+    assert not np.allclose(box_batch.handle.batched_wxyzs, original_wxyzs)
+
+
+def test_viser_batched_instance_colors_preserve_regular_handle_srgb_appearance():
+    from soromox.rendering.viser_renderer import (
+        _viser_batched_colors_and_opacities,
+    )
+
+    colors, opacities = _viser_batched_colors_and_opacities(
+        np.array([[0.9, 0.1, 0.1, 1.0], [0.1, 0.7, 0.2, 0.5]])
+    )
+
+    assert_array_equal(colors, np.array([[201, 3, 3], [3, 114, 8]], dtype=np.uint8))
+    assert_allclose(opacities, np.array([1.0, 0.5], dtype=np.float32))
+
+
+def test_viser_defaults_to_swept_backbone():
+    from soromox.rendering.viser_renderer import ViserRenderer
+
+    robot = DummySpatialRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+    renderer = ViserRenderer(robot, auto_start=False)
+
+    assert renderer._backbone_style == "swept"
+
+
+def test_viser_ground_plane_uses_shared_surface_and_grid():
+    from soromox.rendering.viser_renderer import SceneHandles, ViserRenderer
+
+    robot = DummySpatialRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+    renderer = ViserRenderer(
+        robot,
+        auto_start=False,
+        config=RendererConfig(scene=SceneConfig(ground=GroundPlaneConfig(size=0.4))),
+    )
+    renderer._server = FakeViserActuatorServer()
+    renderer._scene_handles = SceneHandles()
+    renderer._add_ground_plane()
+    scene = renderer._server.scene
+    assert len(scene.trimeshes) == len(scene.line_segments) == 1
+    assert_allclose(np.ptp(scene.trimeshes[0].mesh.vertices, axis=0), [0.4, 0.4, 0])
+    assert len(renderer._scene_handles.ground_planes) == 2
+    renderer._add_ground_plane()
+    assert scene.trimeshes[0].remove_count == 1
+    assert len(renderer._scene_handles.ground_planes) == 2
+
+
+def test_viser_automatic_ground_plane_covers_batched_base_layout():
+    from soromox.rendering.viser_renderer import SceneHandles, ViserRenderer
+
+    robot = DummySpatialRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+    renderer = ViserRenderer(
+        robot,
+        auto_start=False,
+        config=RendererConfig(
+            scene=SceneConfig(ground=GroundPlaneConfig(surface=True))
+        ),
+    )
+    renderer._server = FakeViserActuatorServer()
+    renderer._scene_handles = SceneHandles()
+    renderer._add_ground_plane(np.array([[0.0, -1.0, 0.0], [0.0, 1.0, 0.0]]))
+    vertices = renderer._server.scene.trimeshes[0].mesh.vertices
+    assert np.ptp(vertices[:, 1]) > 2
+    assert_allclose(vertices[:, 2], 0)
+    assert_allclose(vertices.mean(axis=0), [0, 0, 0])
+
+
+def test_viser_swept_backbone_uses_material_frame_contours():
+    from soromox.rendering.viser_renderer import SceneHandles, ViserRenderer
+
+    robot = DummySpatialRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+    renderer = ViserRenderer(
+        robot,
+        auto_start=False,
+        config=RendererConfig(
+            geometry=GeometryConfig(backbone_style="swept", cross_section_resolution=8)
+        ),
+    )
+    server = FakeViserActuatorServer()
+    renderer._server = server
+    renderer._scene_handles = SceneHandles()
+    curves = np.array([[[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]]])
+    material_frames = np.broadcast_to(np.eye(3), (1, 2, 3, 3)).copy()
+
+    renderer._build_robot_geometry(
+        curves,
+        np.ones((1, 2, 4), dtype=np.float64),
+        material_frames=material_frames,
+        base_plate_color=(0.15, 0.15, 0.15),
+    )
+
+    first_contour = server.scene.simple_meshes[0].vertices[:8]
+    assert_allclose(first_contour[:, 0], 0.0, atol=1e-7)
+    assert np.ptp(first_contour[:, 1]) == pytest.approx(0.04)
+
+
+@pytest.mark.parametrize(
+    (
+        "geometry",
+        "base_dimensions",
+        "tip_dimensions",
+        "base_spans_yz",
+        "tip_spans_yz",
+    ),
+    [
+        (CrossSectionGeometry.CIRCULAR, [0.2], [0.1], [0.4, 0.4], [0.2, 0.2]),
+        (
+            CrossSectionGeometry.ELLIPTICAL,
+            [0.3, 0.1],
+            [0.15, 0.05],
+            [0.6, 0.2],
+            [0.3, 0.1],
+        ),
+        (
+            CrossSectionGeometry.RECTANGULAR,
+            [0.4, 0.2],
+            [0.2, 0.1],
+            [0.4, 0.2],
+            [0.2, 0.1],
+        ),
+    ],
+)
+def test_viser_swept_backbone_preserves_varying_cross_section_contours(
+    geometry,
+    base_dimensions,
+    tip_dimensions,
+    base_spans_yz,
+    tip_spans_yz,
+):
+    from soromox.rendering.viser_renderer import SceneHandles, ViserRenderer
+
+    renderer = ViserRenderer(
+        ProfiledSpatialRobot(geometry, base_dimensions, tip_dimensions),
+        auto_start=False,
+        config=RendererConfig(
+            geometry=GeometryConfig(
+                backbone_style="swept", num_points=2, cross_section_resolution=8
+            )
+        ),
+    )
+    server = FakeViserActuatorServer()
+    renderer._server = server
+    renderer._scene_handles = SceneHandles()
+    curves = np.array([[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]])
+    material_frames = np.broadcast_to(np.eye(3), (1, 2, 3, 3)).copy()
+
+    renderer._build_robot_geometry(
+        curves,
+        np.ones((1, 2, 4), dtype=np.float64),
+        material_frames=material_frames,
+        base_plate_color=(0.15, 0.15, 0.15),
+    )
+
+    vertices = server.scene.simple_meshes[0].vertices
+    assert_allclose(np.ptp(vertices[:8, 1:], axis=0), base_spans_yz)
+    assert_allclose(np.ptp(vertices[8:16, 1:], axis=0), tip_spans_yz)
+
+
+def test_viser_swept_backbone_keeps_link_interfaces_discontinuous():
+    from soromox.rendering.viser_renderer import SceneHandles, ViserRenderer
+
+    renderer = ViserRenderer(
+        DiscontinuousTwoLinkRobot(jnp.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])),
+        auto_start=False,
+        config=RendererConfig(
+            geometry=GeometryConfig(
+                backbone_style="swept", num_points=8, cross_section_resolution=8
+            )
+        ),
+    )
+    server = FakeViserActuatorServer()
+    renderer._server = server
+    renderer._scene_handles = SceneHandles()
+    curves, frames = renderer.compute_backbone_curves_and_frames_batched(
+        jnp.zeros((1, 0)), jnp.zeros((1, 3))
+    )
+    colors = renderer.resolve_backbone_colors(1).per_robot_point_rgba
+
+    renderer._build_robot_geometry(
+        np.asarray(curves),
+        colors,
+        material_frames=np.asarray(frames),
+        base_plate_color=(0.15, 0.15, 0.15),
+    )
+
+    edge_indices = {
+        edge_index
+        for batch in renderer._scene_handles.swept_backbone_batches[0]
+        for edge_index in batch.segment_indices
+    }
+    assert edge_indices == {0, 1, 2, 4, 5, 6}
+    assert renderer._cross_sections[3].geometry == CrossSectionGeometry.RECTANGULAR
+    assert renderer._cross_sections[4].geometry == CrossSectionGeometry.CIRCULAR
+    assert renderer._swept_edge_caps[2] == (False, True)
+    assert renderer._swept_edge_caps[4] == (True, False)
+
+
+def test_viser_swept_body_owns_closed_tip_and_updates_atomically():
+    from soromox.rendering.viser_renderer import SceneHandles, ViserRenderer
+
+    robot = DummySpatialRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+    renderer = ViserRenderer(
+        robot,
+        auto_start=False,
+        config=RendererConfig(
+            geometry=GeometryConfig(backbone_style="swept", cross_section_resolution=8)
+        ),
+    )
+    server = FakeViserActuatorServer()
+    renderer._server = server
+    renderer._scene_handles = SceneHandles()
+    frames = np.broadcast_to(np.eye(3), (1, 2, 3, 3)).copy()
+    colors = np.ones((1, 2, 4), dtype=np.float64)
+    initial_curve = np.array([[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]])
+    updated_curve = np.array([[[0.0, 0.0, 0.0], [1.0, 1.0, 0.0]]])
+
+    renderer._build_robot_geometry(
+        initial_curve,
+        colors,
+        material_frames=frames,
+        base_plate_color=(0.15, 0.15, 0.15),
+    )
+    renderer._update_robot_geometry(updated_curve, frames)
+
+    tip_mesh = server.scene.simple_meshes[0]
+    body_tip_contour = tip_mesh.vertices[8:16]
+    cap_triangles = tip_mesh.faces[-8:]
+    assert server.atomic_calls == 1
+    assert_allclose(body_tip_contour.mean(axis=0), updated_curve[0, -1], atol=1e-7)
+    assert_allclose(tip_mesh.vertices[-1], updated_curve[0, -1], atol=1e-7)
+    assert np.all(cap_triangles[:, 0] == 16)
+    assert server.scene.icospheres == []
+
+
+def test_viser_frame_update_uses_one_atomic_transaction():
+    from soromox.rendering.viser_renderer import SceneHandles, ViserRenderer
+
+    robot = DummySpatialRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+    renderer = ViserRenderer(
+        robot,
+        auto_start=False,
+        config=RendererConfig(
+            geometry=GeometryConfig(backbone_style="swept", cross_section_resolution=8),
+            scene=SceneConfig(ground=GroundPlaneConfig(visible=False)),
+        ),
+    )
+    server = FakeViserActuatorServer()
+    renderer._server = server
+    renderer._scene_handles = SceneHandles()
+    q_ts = jnp.zeros((1, 2, 0))
+    offsets = jnp.zeros((1, 3))
+    curves, frames = renderer.compute_backbone_curves_and_frames_batched(
+        q_ts[:, 0], offsets
+    )
+    colors = renderer.resolve_backbone_colors(1).per_robot_point_rgba
+    renderer._build_robot_geometry(
+        np.asarray(curves),
+        colors,
+        material_frames=np.asarray(frames),
+        base_plate_color=renderer.color_config.base_plate_color,
+    )
+
+    renderer._update_frame(
+        1,
+        q_ts,
+        offsets,
+        colors,
+        base_plate_color=renderer.color_config.base_plate_color,
+        render_actuators=False,
+    )
+
+    assert server.atomic_calls == 1
+
+
+def test_viser_swept_batches_match_segment_geometry_across_animation_frames():
+    from soromox.rendering.cross_sections import loft_cross_section_contours
+    from soromox.rendering.viser_renderer import SceneHandles, ViserRenderer
+
+    robot = DummySpatialRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+    renderer = ViserRenderer(
+        robot,
+        auto_start=False,
+        config=RendererConfig(
+            geometry=GeometryConfig(backbone_style="swept", cross_section_resolution=8)
+        ),
+    )
+    server = FakeViserActuatorServer()
+    renderer._server = server
+    renderer._scene_handles = SceneHandles()
+    frames = np.broadcast_to(np.eye(3), (1, 4, 3, 3)).copy()
+    colors = np.array(
+        [
+            [
+                [1.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0, 1.0],
+                [1.0, 0.0, 0.0, 1.0],
+                [1.0, 0.0, 0.0, 1.0],
+            ]
+        ]
+    )
+    curves = np.array(
+        [
+            [
+                [[0.0, 0.0, 0.0], [0.4, 0.0, 0.0], [0.8, 0.1, 0.0], [1.2, 0.1, 0.0]],
+                [[0.0, 0.0, 0.0], [0.4, 0.1, 0.0], [0.8, 0.2, 0.1], [1.2, 0.3, 0.2]],
+                [[0.0, 0.0, 0.0], [0.3, -0.1, 0.1], [0.7, -0.2, 0.2], [1.1, -0.3, 0.3]],
+            ]
+        ]
+    )
+
+    renderer._build_robot_geometry(
+        curves[:, 0],
+        colors,
+        material_frames=frames,
+        base_plate_color=(0.15, 0.15, 0.15),
+    )
+
+    def assert_batches_match(frame_idx):
+        if frame_idx:
+            renderer._update_robot_geometry(curves[:, frame_idx], frames)
+        for batch in renderer._scene_handles.swept_backbone_batches[0]:
+            expected_vertices = []
+            expected_faces = []
+            vertex_offset = 0
+            for segment_idx in batch.segment_indices:
+                vertices, faces = loft_cross_section_contours(
+                    curves[0, frame_idx, segment_idx],
+                    curves[0, frame_idx, segment_idx + 1],
+                    frames[0, segment_idx],
+                    frames[0, segment_idx + 1],
+                    renderer._cross_section_contours[segment_idx],
+                    renderer._cross_section_contours[segment_idx + 1],
+                    cap_end=segment_idx == curves.shape[2] - 2,
+                )
+                expected_vertices.append(vertices)
+                expected_faces.append(faces + vertex_offset)
+                vertex_offset += len(vertices)
+            assert_allclose(batch.handle.vertices, np.concatenate(expected_vertices))
+            assert_array_equal(batch.handle.faces, np.concatenate(expected_faces))
+
+    assert len(server.scene.simple_meshes) == 2
+    assert_batches_match(0)
+    assert_batches_match(1)
+    assert_batches_match(2)
+
+
+def test_viser_default_camera_uses_shared_configuration():
+    from soromox.rendering.viser_renderer import ViserRenderer
+
+    robot = DummySpatialRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+    renderer = ViserRenderer(robot, auto_start=False)
+    client = FakeViserClient()
+    renderer._server = FakeViserServer({"client": client})
+    curves = np.array([[[0.0, 0.0, 0.0], [2.0, 1.0, 0.0]]])
+
+    renderer._setup_camera(curves, camera_config=None)
+
+    max_extent = 2.0
+    center = np.array([1.0, 0.5, 0.0])
+    expected_position = (
+        center
+        + np.array([0.8, -0.8, 0.5])
+        * max_extent
+        * renderer.config.camera.distance_factor
+    )
+    assert_allclose(client.camera.look_at, center, atol=1e-12)
+    assert_allclose(client.camera.position, expected_position, atol=1e-12)
+    assert_allclose(client.camera.fov, np.deg2rad(75.0), atol=1e-12)
+
+
+def test_viser_actuator_geometry_updates_existing_line_handles():
+    from soromox.rendering.viser_renderer import SceneHandles, ViserRenderer
+
+    robot = DummyActuatedSpatialRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+    renderer = ViserRenderer(robot, auto_start=False)
+    renderer._server = FakeViserActuatorServer()
+    renderer._scene_handles = SceneHandles()
+
+    renderer._build_actuator_geometry(
+        jnp.zeros((1, 0)),
+        np.zeros((1, 3)),
+        1,
+    )
+
+    first_handles = tuple(renderer._scene_handles.actuator_lines)
+    assert len(first_handles) == 2
+    assert len(renderer._server.scene.line_segments) == 2
+
+    renderer._build_actuator_geometry(
+        jnp.zeros((1, 0)),
+        np.array([[1.0, 0.0, 0.0]]),
+        1,
+        actuator_inputs=jnp.array([[1.0, 2.0]]),
+    )
+
+    assert tuple(renderer._scene_handles.actuator_lines) == first_handles
+    assert len(renderer._server.scene.line_segments) == 2
+    assert all(handle.remove_count == 0 for handle in first_handles)
+    assert_allclose(first_handles[0].points[0, 0], np.array([1.0, 0.1, 0.0]))
+
+
+def test_viser_paused_frame_slider_seeks_rendered_frame():
+    from soromox.rendering.viser_renderer import AnimationState, ViserRenderer
+
+    robot = DummySpatialRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+    renderer = ViserRenderer(robot, auto_start=False)
+    renderer._server = FakeViserPlaybackServer()
+    renderer._animation_state = AnimationState(
+        frame_idx=0,
+        playing=False,
+        num_frames=4,
+        ts=np.array([0.0, 0.1, 0.2, 0.3]),
+    )
+    sought_frames = []
+
+    renderer._setup_playback_gui(on_frame_seek=sought_frames.append)
+    renderer._gui_handles["frame_slider"].trigger_update(2)
+
+    assert renderer._animation_state.frame_idx == 2
+    assert sought_frames == [2]
+    assert renderer._gui_handles["time_text"].value == "t = 0.20 s"
+
+    renderer._gui_handles["frame_slider"].trigger_update(99)
+
+    assert renderer._animation_state.frame_idx == 3
+    assert sought_frames == [2, 3]
+    assert renderer._gui_handles["frame_slider"].value == 3
+    assert renderer._gui_handles["time_text"].value == "t = 0.30 s"
+
+
+@pytest.mark.parametrize(
+    "style", ["disk", "beveled_disk", "truncated_cone", "flared_collar"]
+)
+def test_viser_registers_shared_mount_geometry(monkeypatch, style):
+    """Every mount style uses the shared shape, radius scaling and material color."""
+    pytest.importorskip("viser")
+    from soromox.rendering.viser_renderer import ViserRenderer
+
+    robot = DummySpatialRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+    renderer = ViserRenderer(
+        robot,
+        auto_start=False,
+        config=RendererConfig(
+            geometry=GeometryConfig(base_plate_style=style, base_plate_thickness=0.024)
+        ),
+    )
+    add = Mock()
+    monkeypatch.setattr(renderer, "_add_trimesh", add)
+    renderer._add_base_plate(0, np.array([0.4, 0.2, 0.3]), (0.2, 0.3, 0.4))
+    mesh = add.call_args.kwargs["mesh"]
+    vertices, faces = base_plate_mesh(0.04, 0.024, style)
+    assert_allclose(mesh.vertices, vertices, atol=1e-8)
+    assert_array_equal(mesh.faces, faces)
+    assert add.call_args.kwargs["surface_color"] == (0.2, 0.3, 0.4)
+    assert_allclose(add.call_args.kwargs["position"], [0.388, 0.2, 0.3])
+
+
+@pytest.mark.parametrize("gap", [0.0, 0.01])
+def test_viser_internal_caps_follow_world_contour_continuity(gap):
+    from soromox.rendering.viser_renderer import SceneHandles, ViserRenderer
+
+    robot = DummySpatialRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+    robot.segment_length = jnp.array([0.6, 0.4])
+    renderer = ViserRenderer(
+        robot,
+        auto_start=False,
+        config=RendererConfig(
+            geometry=GeometryConfig(num_points=8, cross_section_resolution=8)
+        ),
+    )
+    curves, frames = renderer.compute_backbone_curves_and_frames_batched(
+        jnp.zeros((1, 0)), jnp.zeros((1, 3))
+    )
+    curves, frames = np.array(curves), np.array(frames)
+    curves[:, 4:, 0] += gap
+    caps = renderer._matching_swept_edge_caps(curves[0], frames[0])
+    assert caps[2][1] == bool(gap)
+    assert caps[4][0] == bool(gap)
+    assert caps[6][1]  # Keep the exposed tip closed.
+    server = FakeViserActuatorServer()
+    renderer._server = server
+    renderer._scene_handles = SceneHandles()
+    renderer._build_robot_geometry(
+        curves,
+        np.ones((1, 8, 4)),
+        material_frames=frames,
+        base_plate_color=(0.15, 0.15, 0.15),
+    )
+    mesh = server.scene.simple_meshes[0]
+    expected_faces = 6 * 16 + (3 if gap else 1) * 8
+    assert len(mesh.faces) == expected_faces
+    renderer._update_robot_geometry(curves + [0, 0.02, 0], frames)
+    assert len(mesh.faces) == expected_faces
+    # A later pose can open or close the interface; update its topology too.
+    curves[:, 4:, 0] += 0.01 if not gap else -gap
+    renderer._update_robot_geometry(curves, frames)
+    assert len(mesh.faces) == 6 * 16 + (1 if gap else 3) * 8

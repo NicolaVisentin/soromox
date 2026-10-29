@@ -1,5 +1,8 @@
 # Examples
 
+See [Parameters, Updates, and Optimization](parameters-and-optimization.md)
+for complete construction, immutable update, JAX, and Optax examples.
+
 This page provides a comprehensive overview of the example scripts included with SoRoMoX. Examples are organized by application area to help you find the right starting point for your use case.
 
 !!! tip "Getting Started"
@@ -9,12 +12,13 @@ This page provides a comprehensive overview of the example scripts included with
 
 ## Overview
 
-SoRoMoX examples are organized into four main categories:
+SoRoMoX examples are organized into two main categories:
 
 - **[Simulation Examples](#simulation-examples)** - Dynamic simulations of various robot systems
 - **[Control Examples](#control-examples)** - Control algorithms for different control spaces
-- **[System Identification Examples](#system-identification-examples)** - Parameter estimation from experimental data
-- **[Analysis Examples](#analysis-examples)** - Numerical analysis and stability studies
+
+Reproducible paper benchmarks, system identification, optimization, and
+application studies are catalogued separately in `paper_results/README.md`.
 
 ---
 
@@ -121,18 +125,6 @@ python examples/simulation/pcs/simulate_batched_tendon_actuated_pcs.py
 
 **Key concepts:** Tendon kinematics, actuation space, batch simulation
 
-#### Pneumatic-Actuated Planar PCS
-```bash
-python examples/simulation/pcs/simulate_pneumatic_actuated_planar_pcs.py
-```
-
-**What you'll learn:**
-- Pneumatic actuation modeling
-- Pressure-to-strain mapping
-- Pneumatic soft robot dynamics
-
-**Key concepts:** Pneumatic actuation, pressure control
-
 #### I-SUPPORT Manipulator
 ```bash
 python examples/simulation/pcs/simulate_isupport.py
@@ -145,37 +137,29 @@ python examples/simulation/pcs/simulate_isupport.py
 
 **Key concepts:** Additive manufacturing, pneumatic actuation, real-world applications
 
-### HSA (Handed Shearing Auxetics) Robots
-
-HSA robots use auxetic materials that exhibit unique deformation characteristics under actuation.
-
 #### Planar HSA Robot
-```bash
-# Basic simulation
-python examples/simulation/hsa/simulate_planar_hsa.py
 
-# Motor-to-end-effector Jacobian demonstration
-python examples/simulation/hsa/demo_planar_hsa_motor2ee_jacobian.py
+Planar HSA robots are a specialized PCS family using auxetic materials that exhibit unique deformation characteristics under actuation.
+
+```bash
+# Planar HSA simulation
+python examples/simulation/pcs/simulate_planar_hsa.py
 ```
 
 **What you'll learn:**
 - Handed Shearing Auxetics (HSA) mechanics and unique deformation characteristics
-- Motor-to-end-effector Jacobian computation for control
 - Practical control applications with HSA robots
 
-**Key concepts:** HSA mechanics, auxetic materials, motor-space to task-space mapping
+**Key concepts:** HSA mechanics, auxetic materials, PCS simulation
 
 ### GVS (Geometric Variable Strain) Robots
 
 GVS robots use flexible strain basis functions for advanced continuum robot modeling.
 
-#### GVS Robots
+#### Basic GVS Robots
 ```bash
 # Basic GVS simulation
 python examples/simulation/gvs/simulate_gvs.py
-
-# Tendon-actuated GVS
-python examples/simulation/gvs/simulate_tendon_actuated_gvs.py
 ```
 
 **What you'll learn:**
@@ -185,64 +169,117 @@ python examples/simulation/gvs/simulate_tendon_actuated_gvs.py
 
 **Key concepts:** GVS modeling, basis functions, advanced kinematics
 
+#### Low-Dimensional Rigid-Soft Pendulums
+
+```bash
+# Fixed-base affine Soft Inverted Pendulum
+python examples/simulation/gvs/simulate_soft_inverted_pendulum.py
+
+# Base-torque-actuated R-SIP
+python examples/simulation/gvs/simulate_r_soft_inverted_pendulum.py
+
+# Force-actuated cart with a passive revolute pole hinge
+python examples/simulation/gvs/simulate_soft_cart_pole.py
+
+# The same Cart-Pole with stiffness derived from E, radius, and link length
+python examples/simulation/gvs/simulate_soft_cart_pole.py --stiffness-mode material_derived
+
+# First-joint-torque-actuated two-link Pendubot
+python examples/simulation/gvs/simulate_soft_pendubot.py
+
+# First-joint-torque-actuated spatial Furuta pendulum
+python examples/simulation/gvs/simulate_soft_furuta.py
+```
+
+Every soft link uses two dimensionless affine bending-angle coefficients,
+`kappa(X) = (a0 + a1 X/L) / L`, through
+`scale_rotational_basis_by_length=True`. The fixed SIP, R-SIP, and Cart-Pole
+use the explicit affine constitutive matrices and link properties from
+[Della Santina (2020)](https://doi.org/10.1109/CDC42340.2020.9303976); their
+1 kg link mass is distributed rather than concentrated at the tip. The R-SIP
+base-joint damping follows
+[Caradonna et al. (2024)](https://doi.org/10.1109/LRA.2024.3389348).
+
+The Cart-Pole coordinate order is `[d, theta, a0, a1]`. Only `d` is actuated,
+the revolute hinge is passive, and the all-zero configuration points straight
+upward. This differs by an angle offset from the convention in
+[Caradonna et al. (2026)](https://arxiv.org/abs/2602.03435):
+`theta_model = theta_paper - pi`. Its finite rigid cart/pivot link has exposed
+assumed length, radius, and mass parameters.
+
+The SIP, R-SIP, and Cart-Pole support `explicit_affine` and
+`material_derived` soft-link stiffness modes. The backward-compatible explicit
+mode uses `K = k H`. The material mode uses `K = E I/L H` with
+`I = pi r^4/4`; its defaults are `E = 1 MPa` and `r = 0.03 m`, giving
+`E I/L = 0.6362 N m`. Only stiffness changes between modes: soft-link mass,
+inertial geometry, and damping remain the SIP defaults.
+
+The Pendubot and Furuta use the 2026 paper's cylindrical soft-link properties
+(`L = 1 m`, `R = 0.03 m`, `rho = 1000 kg/m^3`, `E = 1 MPa`, and
+`beta = 0.01 MPa s`) but restrict deformation to affine bending. SoRoMoX uses
+`G = E/3` instead of the boundary value `nu = 0.5`. The Pendubot splits the
+soft length equally between its two links. Because the paper does not report
+Furuta rigid-arm inertia, its default `0.5 m` length, `0.02 m` radius, and
+`0.5 kg` mass are documented, configurable assumptions.
+
+Actuation matches the cited systems: base torque for R-SIP, cart force for the
+Cart-Pole, and first-joint torque for Pendubot and Furuta. Metadata bounds are
+respectively unbounded, `+/-200 N`, `+/-10 N m`, and `+/-80 N m`; the model does
+not implicitly clip an input. Controllers are intentionally outside these
+open-loop examples.
+
+Each script saves a four-panel summary figure and launches an interactive Viser
+rendering by default. The Cart-Pole renderer synchronizes the backbone with a
+moving cart, wheels, and rail. Use `--record-viser` to capture one playback or
+`--no-viser --no-show` for headless execution. Default ports are 8080 through
+8084 in the command order above, and every script accepts `--viser-port`.
+
+**What you'll learn:**
+- Affine-curvature GVS construction with two bending coordinates
+- Hybrid rigid-joint, rigid-link, and affine soft-link topology
+- Signed direct force/torque routing with passive coordinates
+- Physically named upright and hanging configuration helpers
+- Interactive trajectory playback and recording with Viser
+
+**Key concepts:** Affine curvature, underactuation, R-SIP, Cart-Pole, Pendubot, Furuta, Viser
+
+#### Tendon-Actuated GVS Robot
+
+```bash
+python examples/simulation/gvs/simulate_tendon_actuated_gvs.py
+```
+
+**What you'll learn:**
+- Routing tendon actuation through a variable-strain continuum model
+- Simulating and rendering an actuated GVS robot
+
+**Key concepts:** GVS modeling, tendon actuation, continuum routing
+
 ---
 
 ## Control Examples
 
 Control examples demonstrate various control algorithms for different control spaces. These examples are located in `examples/control/` and are organized by control space type.
 
-### Configuration-Space Controllers
-
-Configuration-space controllers operate directly on the robot's configuration variables (e.g., joint angles, strain parameters).
-
-#### Setpoint Regulation
-```bash
-python examples/control/configuration_space/setpoint_regulation_comparison.py
-```
-
-**What you'll learn:**
-- Comparison of different configuration-space regulators:
-  - `PIDController` (model-free baseline)
-  - `PotentialCompensationRegulator` (feedforward: G(q_des) + τ_el(q_des))
-  - `PotentialCancellationRegulator` (feedforward: G(q) + τ_el(q))
-  - `GravityCancellationRegulator` (feedforward: G(q) + τ_el(q_des))
-- Model-based feedforward control design
-- Performance comparison of control strategies
-
-**Key concepts:** Configuration-space control, feedforward compensation, gravity cancellation
-
-#### Trajectory Tracking
-```bash
-python examples/control/configuration_space/trajectory_tracking_comparison.py
-```
-
-**What you'll learn:**
-- Trajectory tracking in configuration space
-- Comparison of different tracking controllers
-- Reference trajectory generation and tracking
-
-**Key concepts:** Trajectory tracking, configuration-space control, reference generation
-
 ### Operational-Space Controllers
 
 Operational-space controllers operate on the robot's end-effector or task-space coordinates.
 
-#### Impedance Control
+#### Synergistic Control
 ```bash
-python examples/control/operational_space/control_pcs_with_impedance.py
+python examples/control/operational_space/control_tendon_actuated_pcs_with_synergistic.py
 ```
 
 **What you'll learn:**
-- Operational-space impedance control for PCS robots
-- Partial feedback linearization
-- End-effector position tracking
-- Impedance behavior design (stiffness and damping)
+- Operational-space control for an underactuated tendon-driven PCS robot
+- End-effector position tracking with actuation synergies
+- Task-space reference generation
 
-**Key concepts:** Operational-space control, impedance control, feedback linearization, task-space control
+**Key concepts:** Operational-space control, underactuation, synergistic control
 
 ### Actuation-Space Controllers
 
-Actuation-space controllers operate directly on the actuator inputs (e.g., tendon tensions, pneumatic pressures).
+Actuation-space controllers operate directly on the actuator inputs (e.g., tendon tensions, chamber pressures).
 
 #### Setpoint Regulation
 ```bash
@@ -255,50 +292,6 @@ python examples/control/actuation_space/setpoint_regulation_comparison.py
 - Comparison of actuation-space control strategies
 
 **Key concepts:** Actuation-space control, actuator mapping, direct control
-
----
-
-## System Identification Examples
-
-System identification examples demonstrate how to estimate model parameters from experimental data. These examples are located in `examples/system_identification/`.
-
-### Parameter Identification
-
-#### Soft Tentacle Parameter Identification
-```bash
-python examples/system_identification/identify_soft_tentacle_parameters.py
-```
-
-**What you'll learn:**
-- Parameter estimation from experimental data
-- Gradient-based optimization for system identification
-- Model fitting techniques using JAX and Optimistix
-- Validation against measurements
-- Working with motion capture (MoCap) data
-
-**Key concepts:** System identification, parameter estimation, optimization, experimental validation
-
-**Data:** The example uses experimental data from the `examples/system_identification/data/` directory, including various motion capture recordings with different actuation inputs.
-
----
-
-## Analysis Examples
-
-Analysis examples demonstrate numerical analysis techniques and stability studies. These examples are located in `examples/analysis/`.
-
-### Singularities and Differentiability
-
-```bash
-# Located in examples/analysis/singularities_and_differentiability/
-```
-
-**What you'll learn:**
-- Singular configuration analysis
-- Differentiability properties of robot models
-- Numerical stability assessment
-- Workspace analysis
-
-**Key concepts:** Singularities, differentiability, numerical stability, workspace analysis
 
 ---
 
@@ -337,8 +330,7 @@ Follow these steps to run any example:
    For example:
    ```bash
    python examples/simulation/pendulum/simulate_pendulum.py
-   python examples/control/configuration_space/setpoint_regulation_comparison.py
-   python examples/system_identification/identify_soft_tentacle_parameters.py
+   python examples/control/actuation_space/setpoint_regulation_comparison.py
    ```
 
 3. **Analyze results** in generated plots and videos
@@ -362,40 +354,47 @@ Most examples allow easy parameter modification. Understanding parameter structu
 **For PCS systems:**
 
 ```python
-# Modify physical parameters
-params = {
-    "L": 0.2 * jnp.ones((num_segments,)),  # Change segment lengths
-    "r": 0.01 * jnp.ones((num_segments,)),  # Change radii  
-    "E": 1e6 * jnp.ones((num_segments,)),  # Change Young's modulus
-    "G": 5e5 * jnp.ones((num_segments,)),  # Change shear modulus
-    # ... other parameters
-}
+# Modify canonical runtime link parameters
+section = robot.params.link.cross_section.replace(
+    coefficients=0.9 * robot.params.link.cross_section.coefficients
+)
+robot = robot.update_link_params(
+    length=0.2 * jnp.ones((num_segments,)),
+    cross_section=section,
+)
+
+# Material variables are caller-owned and applied explicitly.
+material = material.replace(
+    young_modulus=1e6 * jnp.ones((num_segments,)),
+    shear_modulus=5e5 * jnp.ones((num_segments,)),
+)
+robot = robot.with_isotropic_material(material)
 ```
 
 **For pendulum systems:**
 
 ```python
-params = {
-    "L": jnp.array([0.5, 0.3]),      # Link lengths
-    "m": jnp.array([1.0, 0.5]),      # Masses
-    "I": jnp.array([0.1, 0.05]),     # Moments of inertia
-    # ... other parameters
-}
+params = params.replace(
+    length=jnp.array([0.5, 0.3]),
+    mass=jnp.array([1.0, 0.5]),
+    moment_inertia=jnp.array([0.1, 0.05]),
+)
+robot = robot.with_params(params)
 ```
 
 **For articulated soft robot systems:**
 
 ```python
-params = {
-    "joint_screws": joint_screws,  # Shape (N, 6), screw axes [omega, v]
-    "p_tip": p_tip,                # Shape (N, 3), link tip vectors
-    "p_com": p_com,                # Shape (N, 3), link COM vectors
-    "m": masses,                   # Shape (N,), link masses
-    "I_com": I_com,                # Shape (N, 3, 3), COM inertias
-    "g": jnp.array([0.0, 0.0, -9.81]),
-    "K": jnp.diag(joint_stiffness),  # Optional joint stiffness
-    "D": jnp.diag(joint_damping),    # Optional joint damping
-}
+params = params.replace(
+    joint_screw=joint_screws,
+    tip_position=tip_positions,
+    center_of_mass_position=center_of_mass_positions,
+    mass=masses,
+    center_of_mass_inertia=center_of_mass_inertia,
+    joint_stiffness=jnp.diag(joint_stiffness),
+    joint_damping=jnp.diag(joint_damping),
+)
+robot = robot.with_params(params)
 ```
 
 ### Output Customization
@@ -461,7 +460,7 @@ D_x = 10.0 * jnp.eye(3)   # Damping matrix
 | **Missing example dependencies** | Install examples group with `pip install -e ".[examples]"` |
 | **Missing renderers** | Ensure SoRoMoX is installed with `pip install -e ".[rendering]"` or `pip install -e ".[all]"` |
 | **JAX precision warnings or simulation instability** | Most simulations require double precision. Enable with `jax.config.update("jax_enable_x64", True)` at the beginning of the script |
-| **Video codec issues** | Ensure FFmpeg is properly installed: `pip install ffmpeg-python` |
+| **Video codec issues** | Install FFmpeg with your system package manager and verify the executable is available with `ffmpeg -version` |
 | **Matplotlib backend errors** | Try setting backend: `export MPLBACKEND=Agg` for headless systems |
 | **Out of memory errors** | Reduce batch sizes or use smaller simulation parameters |
 | **Optimization convergence issues** | Check initial parameter guesses and optimization settings in system identification examples |
@@ -484,12 +483,10 @@ To create a new example:
 1. **Choose a base example** similar to your use case from the appropriate category:
    - `examples/simulation/` for new robot systems
    - `examples/control/` for new control algorithms
-   - `examples/system_identification/` for parameter estimation methods
-   - `examples/analysis/` for numerical analysis studies
 
 2. **Copy and modify** parameters and logic
 3. **Test thoroughly** with different configurations
-4. **Follow the existing structure** and naming conventions
+4. **Write generated artifacts to sibling `figures/` or `videos/` directories**
 
 ### Example Template
 
@@ -509,9 +506,7 @@ from soromox.systems import YourSystem, SystemState
 jax.config.update("jax_enable_x64", True)  # double precision
 
 # Parameters
-params = {
-    # Your parameters here
-}
+params = YourSystemParams(...)
 
 if __name__ == "__main__":
     # Initialize system

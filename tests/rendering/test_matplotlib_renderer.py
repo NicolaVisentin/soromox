@@ -1,0 +1,315 @@
+from inspect import signature
+
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from numpy.testing import assert_allclose
+
+from soromox.rendering.actuators import ActuatorVisualLayer
+from soromox.rendering.config import (
+    GeometryConfig,
+    RendererConfig,
+    RenderOutputConfig,
+    SceneConfig,
+)
+from soromox.rendering.config.camera import CameraConfig
+from soromox.rendering.matplotlib_renderer import MatplotlibRenderer
+from soromox.systems.components import CrossSectionGeometry
+from soromox.utils.geometry import poses
+
+
+class DummySpatialRobot:
+    is_planar = False
+    floating_base = False
+    length = jnp.array(1.0)
+    segment_length = jnp.array([1.0])
+
+    def __init__(self, base_pose: jnp.ndarray):
+        self.fixed_base_pose = jnp.asarray(base_pose)
+        self.base_transform = poses.quaternion_pose_to_transform(self.fixed_base_pose)
+
+    def forward_kinematics_abscissa_batched(self, q, s_points):
+        del q
+        transforms = jnp.repeat(
+            self.base_transform[None, :, :], s_points.shape[0], axis=0
+        )
+        offsets = s_points[:, None] * self.base_transform[:3, 0]
+        return transforms.at[:, :3, 3].add(offsets)
+
+    def cross_section_geometry(self, q, s):
+        del q, s
+        return (CrossSectionGeometry.CIRCULAR, jnp.array([0.02]), None)
+
+
+class DummyActuatedSpatialRobot(DummySpatialRobot):
+    def actuator_visual_layers(self, q, s_points, *, actuator_inputs=None):
+        del q, actuator_inputs
+        tendon = jnp.stack(
+            [
+                s_points,
+                jnp.full_like(s_points, 0.1),
+                jnp.zeros_like(s_points),
+            ],
+            axis=1,
+        )[None, ...]
+        return (
+            ActuatorVisualLayer(
+                name="sampled_tendon",
+                kind="tendon",
+                points=tendon,
+            ),
+        )
+
+
+class FakeMatplotlib3DAxis:
+    def __init__(self):
+        self.view = None
+        self.projection = None
+        self.box_aspect = None
+
+    def set_xlim(self, *args):
+        return None
+
+    def set_ylim(self, *args):
+        return None
+
+    def set_zlim(self, *args):
+        return None
+
+    def set_xlabel(self, *args):
+        return None
+
+    def set_ylabel(self, *args):
+        return None
+
+    def set_zlabel(self, *args):
+        return None
+
+    def set_proj_type(self, projection, *, focal_length):
+        self.projection = (projection, float(focal_length))
+
+    def set_box_aspect(self, aspect, *, zoom):
+        self.box_aspect = (tuple(aspect), float(zoom))
+
+    def view_init(self, *, elev, azim):
+        self.view = (float(elev), float(azim))
+
+
+class LegacyFakeMatplotlib3DAxis(FakeMatplotlib3DAxis):
+    def set_proj_type(self, projection):
+        self.projection = projection
+
+    def set_box_aspect(self, aspect):
+        self.box_aspect = tuple(aspect)
+
+
+def test_matplotlib_uses_composed_configuration():
+    parameters = list(signature(MatplotlibRenderer).parameters)
+    assert parameters[:2] == ["robot", "config"]
+    assert "show_ground_plane" not in parameters
+    assert "color_config" not in parameters
+
+
+def test_3d_default_camera_uses_base_pose_orientation():
+    robot = DummySpatialRobot(jnp.array([0.5, -0.5, 0.5, 0.5, 0.0, 0.0, 0.0]))
+    renderer = MatplotlibRenderer(robot)
+    axis = FakeMatplotlib3DAxis()
+
+    renderer._setup_axes(
+        axis,
+        width_m=3.0,
+        scene_center=np.zeros(3),
+        scene_extent=1.0,
+        camera_config=None,
+    )
+
+    assert axis.view is not None
+    expected_view = np.array(
+        [
+            np.degrees(np.arctan2(8.0, np.hypot(8.0, -5.0))),
+            np.degrees(np.arctan2(-5.0, 8.0)),
+        ]
+    )
+    assert_allclose(np.array(axis.view), expected_view, atol=1e-12)
+    assert axis.projection is not None
+    assert axis.projection[0] == "persp"
+    assert axis.projection[1] == pytest.approx(
+        1.0 / np.tan(np.deg2rad(CameraConfig().fov) / 2.0)
+    )
+    assert axis.box_aspect == ((1.0, 1.0, 1.0), 1.0)
+
+
+def test_3d_camera_supports_matplotlib_without_focal_length_or_zoom_keywords():
+    robot = DummySpatialRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+    renderer = MatplotlibRenderer(robot)
+    axis = LegacyFakeMatplotlib3DAxis()
+
+    renderer._setup_axes(
+        axis,
+        width_m=3.0,
+        scene_center=np.zeros(3),
+        scene_extent=1.0,
+        camera_config=CameraConfig(fov=45.0),
+    )
+
+    assert axis.projection == "persp"
+    assert axis.box_aspect == (1.0, 1.0, 1.0)
+
+
+def test_3d_camera_uses_shared_field_of_view():
+    robot = DummySpatialRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+    renderer = MatplotlibRenderer(robot)
+    axis = FakeMatplotlib3DAxis()
+
+    renderer._setup_axes(
+        axis,
+        width_m=3.0,
+        scene_center=np.zeros(3),
+        scene_extent=1.0,
+        camera_config=CameraConfig(fov=45.0),
+    )
+
+    assert axis.projection == (
+        "persp",
+        pytest.approx(1.0 / np.tan(np.deg2rad(45.0) / 2.0)),
+    )
+    assert axis.box_aspect == ((1.0, 1.0, 1.0), 1.2)
+
+
+def test_actuator_overlay_changes_rendered_frame():
+    robot = DummyActuatedSpatialRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+    renderer = MatplotlibRenderer(
+        robot,
+        config=RendererConfig(
+            output=RenderOutputConfig(width=240, height=180),
+            geometry=GeometryConfig(num_points=8),
+        ),
+    )
+
+    without_actuators = renderer.render_frame(jnp.array([]), render_actuators=False)
+    with_actuators = renderer.render_frame(jnp.array([]), render_actuators=True)
+
+    assert without_actuators.shape == with_actuators.shape
+    assert np.any(without_actuators != with_actuators)
+
+
+@pytest.mark.parametrize(
+    "scene",
+    [
+        SceneConfig.technical(),
+        SceneConfig.studio(),
+        SceneConfig.studio("bright"),
+        SceneConfig.studio("dark"),
+        SceneConfig.flat(),
+        RendererConfig.clay().scene,
+    ],
+)
+def test_scene_presets_keep_white_matplotlib_background_and_standard_axes(scene):
+    """Scene presets cannot add a floor, recolor the plot, or change its bounds."""
+    robot = DummySpatialRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+
+    def render(scene):
+        renderer = MatplotlibRenderer(
+            robot,
+            config=RendererConfig(
+                scene=scene,
+                output=RenderOutputConfig(width=240, height=180),
+                geometry=GeometryConfig(num_points=8),
+            ),
+        )
+        with pytest.warns(UserWarning, match="white background"):
+            return renderer.render_frame(jnp.array([]))
+
+    pixels = render(scene)
+    baseline = render(SceneConfig.flat())
+    np.testing.assert_array_equal(pixels, baseline)
+    np.testing.assert_array_equal(pixels[0, 0], [255, 255, 255])
+
+
+def test_2d_base_marker_is_perpendicular_to_base_tangent():
+    base = np.array([1.0, 2.0])
+    tangent = np.array([0.0, 1.0])
+
+    marker = MatplotlibRenderer._base_plate_marker_points(
+        base, tangent, marker_diameter=0.4, dim=2
+    )
+
+    assert marker.shape == (2, 2)
+    assert_allclose(marker.mean(axis=0), base)
+    assert_allclose(marker[1] - marker[0], np.array([-0.4, 0.0]))
+    assert_allclose(np.dot(marker[1] - marker[0], tangent), 0.0, atol=1e-12)
+
+
+def test_3d_base_marker_lies_in_plate_face_plane():
+    base = np.array([1.0, 2.0, 3.0])
+    normal = np.array([1.0, 0.0, 0.0])
+
+    marker = MatplotlibRenderer._base_plate_marker_points(
+        base, normal, marker_diameter=0.4, dim=3
+    )
+
+    assert marker.shape == (65, 3)
+    assert_allclose(marker[0], marker[-1], atol=1e-12)
+    assert_allclose((marker - base) @ normal, np.zeros(marker.shape[0]), atol=1e-12)
+    assert_allclose(np.linalg.norm(marker - base, axis=1), 0.2, atol=1e-12)
+
+
+def test_slider_ignores_studio_background_and_floor(monkeypatch):
+    """Playback uses the same white plotting style as still images."""
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    renderer = MatplotlibRenderer(
+        DummySpatialRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])),
+        config=RendererConfig(scene=SceneConfig.studio("dark")),
+    )
+    inspected = []
+
+    def inspect_figure():
+        fig = plt.gcf()
+        assert_allclose(fig.get_facecolor(), [1, 1, 1, 1])
+        assert_allclose(fig.axes[0].get_facecolor(), [1, 1, 1, 1])
+        # One filled base disk, with no ground or backdrop surfaces.
+        assert (
+            sum(isinstance(item, Poly3DCollection) for item in fig.axes[0].collections)
+            == 1
+        )
+        inspected.append(True)
+
+    monkeypatch.setattr(plt, "show", inspect_figure)
+    with pytest.warns(UserWarning, match="white background"):
+        renderer.animate(jnp.array([0.0, 0.1]), jnp.empty((2, 0)), mode="slider")
+    assert inspected == [True]
+
+
+@pytest.mark.parametrize(
+    "style", ["disk", "beveled_disk", "truncated_cone", "flared_collar"]
+)
+def test_spatial_base_is_a_filled_disk_and_updates_in_place(style):
+    """Detailed mount styles all use a simple disk, including during playback."""
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    renderer = MatplotlibRenderer(
+        DummySpatialRobot(jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])),
+        config=RendererConfig(geometry=GeometryConfig(base_plate_style=style)),
+    )
+    fig = plt.figure()
+    try:
+        ax = fig.add_subplot(projection="3d")
+        curves = np.array([[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]])
+        artists = renderer._plot_base_markers(ax, curves, (0.2, 0.2, 0.2))
+        assert len(artists) == 1
+        disk = artists[0]
+        assert isinstance(disk, Poly3DCollection)
+        assert disk.get_edgecolor().size == 0
+        captured = []
+        disk.set_verts = lambda vertices: captured.append(np.asarray(vertices))
+        renderer._update_base_markers(artists, curves + [0.0, 2.0, 3.0])
+        points = captured[0][0]
+        assert points.shape == (64, 3)
+        assert_allclose(points.mean(axis=0), [0.0, 2.0, 3.0], atol=1e-12)
+        assert_allclose(np.linalg.norm(points - [0.0, 2.0, 3.0], axis=1), 0.04)
+        assert_allclose(points[:, 0], 0.0)
+    finally:
+        plt.close(fig)

@@ -1,3 +1,4 @@
+import argparse
 from functools import partial
 from pathlib import Path
 
@@ -6,18 +7,31 @@ import matplotlib.pyplot as plt
 from jax import numpy as jnp
 
 from soromox.rendering import OpenCVPlanarRenderer, ViserRenderer
-from soromox.systems import Pendulum, SystemState
+from soromox.rendering.config import (
+    BackboneColorConfig,
+    GeometryConfig,
+    GroundPlaneConfig,
+    RendererColorConfig,
+    RendererConfig,
+    RenderOutputConfig,
+    SceneConfig,
+)
+from soromox.systems import Pendulum, PendulumParams, SystemState
 
 jax.config.update("jax_enable_x64", True)  # double precision
 
 num_links = 2
-params = {
-    "m": jnp.array([10.0, 6.0]),
-    "I": jnp.array([3.0, 2.0]),
-    "L": jnp.array([2.0, 1.0]),
-    "Lc": jnp.array([1.0, 0.5]),
-    "g": jnp.array([0.0, -9.81]),
-}
+params = PendulumParams(
+    mass=jnp.array([10.0, 6.0]),
+    moment_inertia=jnp.array([3.0, 2.0]),
+    length=jnp.array([2.0, 1.0]),
+    center_of_mass_length=jnp.array([1.0, 0.5]),
+    gravity=jnp.array([0.0, -9.81]),
+    joint_stiffness=jnp.zeros((num_links, num_links)),
+    joint_damping=jnp.zeros((num_links, num_links)),
+    joint_rest_configuration=jnp.zeros((num_links,)),
+    radius=jnp.array([0.05, 0.05]),
+)
 
 # define initial configuration
 q0 = jnp.zeros((num_links,))
@@ -31,12 +45,22 @@ save_dt = jnp.array(0.01)
 
 # video settings
 video_width, video_height = 700, 700  # img height and width
-video_path = Path("videos") / f"pendulum_nl-{num_links}.mp4"
+video_path = (
+    Path(__file__).resolve().parent / "videos" / f"simulate_pendulum_nl-{num_links}.mp4"
+)
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Simulate an N-link pendulum.")
+    parser.add_argument("--no-viser", action="store_true")
+    parser.add_argument("--video-output", type=Path, default=video_path)
+    args = parser.parse_args()
+    output_path = args.video_output
+    if not output_path.is_absolute():
+        output_path = Path(__file__).resolve().parent / output_path
+
     # Instantiate the pendulum model directly
-    robot = Pendulum(params)
+    robot = Pendulum(params=params)
 
     # initialize velocities and actuation
     qd0 = jnp.zeros_like(q0)  # initial velocities for simulation
@@ -138,16 +162,19 @@ if __name__ == "__main__":
     plt.show()
 
     # create video
-    video_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     renderer = OpenCVPlanarRenderer(
         robot,
-        width=video_width,
-        height=video_height,
-        backbone_color=(0, 0, 0),
         length_scale=2.5,
+        config=RendererConfig(
+            output=RenderOutputConfig(width=video_width, height=video_height),
+            colors=RendererColorConfig(
+                backbone=BackboneColorConfig(segment_colors=(0.0, 0.0, 0.0))
+            ),
+        ),
     )
-    renderer.render_sequence(video_ts, q_ts, record_path=str(video_path))
-    print(f"Video saved to {video_path}")
+    renderer.render_sequence(video_ts, q_ts, record_path=str(output_path))
+    print(f"Video saved to {output_path}")
 
     # =====================================================
     # Viser web-based visualization with plotly plots
@@ -156,13 +183,24 @@ if __name__ == "__main__":
     # may not work well for this planar pendulum system. However, we can still
     # use it to display plotly plots in the GUI.
     # Plotly plots are automatically added to the GUI at the end of the sidebar
-    viser_renderer = ViserRenderer(robot, num_points=50, backbone_style="discrete")
-    viser_renderer.render_sequence(
-        ts,
-        q_ts,
-        playback_speed=1.0,
-        loop=True,
-        autoplay=True,
-        plot_configurations=True,
-        robot_name="Pendulum",
-    )
+    if not args.no_viser:
+        viser_renderer = ViserRenderer(
+            robot,
+            config=RendererConfig(
+                geometry=GeometryConfig(num_points=50, backbone_style="discrete"),
+                scene=SceneConfig.technical(
+                    ground=GroundPlaneConfig(
+                        surface=False, height=-0.06, height_reference="world"
+                    )
+                ),
+            ),
+        )
+        viser_renderer.render_sequence(
+            ts,
+            q_ts,
+            playback_speed=1.0,
+            loop=True,
+            autoplay=True,
+            plot_configurations=True,
+            robot_name="Pendulum",
+        )

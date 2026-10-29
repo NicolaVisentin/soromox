@@ -1,6 +1,6 @@
 __all__ = ["FeedforwardCompensationTracker"]
 
-from typing import Any, Optional, Tuple
+from typing import Any
 
 import jax.numpy as jnp
 from jax import Array
@@ -77,8 +77,7 @@ class FeedforwardCompensationTracker(PIDController):
 
         Args:
             robot: The soft robot system to be controlled.
-                Must have `actuation_matrix(q)`, `inertia_matrix(q)`,
-                `coriolis_matrix(q, qd)`, `gravitational_force(q)`,
+                Must have `actuation_matrix(q)`, `dynamics_terms(q, qd)`,
                 `elastic_force(q)`, and `damping_matrix(q)` methods.
             reference_trajectory: The desired trajectory to track.
                 Must provide x_des_fn (desired configuration), xd_des_fn
@@ -107,9 +106,7 @@ class FeedforwardCompensationTracker(PIDController):
             stacklevel=4,
         )
 
-    def model_based_term(
-        self, system_state: SystemState
-    ) -> Tuple[Array, Optional[Any]]:
+    def model_based_term(self, system_state: SystemState) -> tuple[Array, Any | None]:
         """
         Compute the model-based feedforward control term for trajectory tracking.
 
@@ -132,7 +129,7 @@ class FeedforwardCompensationTracker(PIDController):
         y = system_state.y
 
         # Get current configuration (for actuation matrix)
-        q, _ = jnp.split(y, 2)
+        robot, q, _ = self._controller_robot_and_state(y)
 
         # Get desired trajectory at current time
         assert self.reference_trajectory.x_des_fn is not None
@@ -142,25 +139,18 @@ class FeedforwardCompensationTracker(PIDController):
         qd_des = self.reference_trajectory.xd_des_fn(t)
         qdd_des = self.reference_trajectory.xdd_des_fn(t)
 
-        # Compute dynamics matrices at desired trajectory
-        B_des = self.robot.inertia_matrix(q_des)
-        C_des = self.robot.coriolis_matrix(q_des, qd_des)
-        G_des = self.robot.gravitational_force(q_des)
-        tau_el_des = self.robot.elastic_force(q_des)
-        D_des = self.robot.damping_matrix(q_des)
+        # Compute the coupled dynamics terms at the desired trajectory. The
+        # returned Coriolis term is already contracted with qd_des.
+        B_des, Cqd_des, G_des = robot.dynamics_terms(q_des, qd_des)
+        tau_el_des = robot.elastic_force(q_des)
+        D_des = robot.damping_matrix(q_des)
 
         # Compute inverse dynamics at desired trajectory
         # tau = B @ qdd + C @ qd + G + tau_el + D @ qd
-        tau_model = (
-            B_des @ qdd_des
-            + C_des @ qd_des
-            + G_des
-            + tau_el_des
-            + D_des @ qd_des
-        )
+        tau_model = B_des @ qdd_des + Cqd_des + G_des + tau_el_des + D_des @ qd_des
 
         # Get the actuation matrix at current configuration
-        A = self.robot.actuation_matrix(q)
+        A = robot.actuation_matrix(q)
 
         # Compute actuator input using inverse (or pseudo-inverse) of actuation matrix
         if A.shape[0] == A.shape[1]:
@@ -169,4 +159,3 @@ class FeedforwardCompensationTracker(PIDController):
             u_model = jnp.linalg.pinv(A) @ tau_model
 
         return u_model, None
-

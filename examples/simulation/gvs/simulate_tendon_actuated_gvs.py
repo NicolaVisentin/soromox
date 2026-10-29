@@ -1,23 +1,83 @@
 from functools import partial
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import optimistix as optx
 
+from soromox.actuation import ThreadlikeActuator, ThreadlikeRouting
 from soromox.rendering import Open3DRenderer
+from soromox.rendering.config import (
+    BackboneColorConfig,
+    CameraConfig,
+    GeometryConfig,
+    GroundPlaneConfig,
+    RendererColorConfig,
+    RendererConfig,
+    SceneConfig,
+)
 from soromox.systems import (
-    CrossSectionGeometry,
+    GVS,
     GVSSegment,
     JointSpec,
+    LinearProfile,
     LinkSpec,
     StrainBasisSpec,
     SystemState,
-    TendonActuatedGVS,
 )
+from soromox.utils.geometry import poses
+
+VIDEO_OUTPUT = Path(__file__).resolve().parent / "videos" / f"{Path(__file__).stem}.mp4"
 
 jax.config.update("jax_enable_x64", True)
 # jax.config.update("jax_platform_name", "gpu")  # or "cpu"
+
+# Demonstration settings: reduced viscous damping lets the elastic recoil and
+# the unactuated tip's lag remain visible after each pull.
+MATERIAL_DAMPING = 2e3
+MOTION_TIMES = jnp.array(
+    [
+        0.0,
+        0.35,
+        0.50,
+        1.15,
+        1.45,
+        2.05,
+        2.35,
+        3.0,
+        3.30,
+        3.95,
+        4.25,
+        4.9,
+        5.2,
+        5.9,
+        6.2,
+        6.4,
+    ]
+)
+# Tendon tensions in newtons. Alternate the bending direction, pull both
+# tendons to curl forward, and release between bursts to excite free motion.
+MOTION_TENSIONS = jnp.array(
+    [
+        [3.0, 0.0],
+        [3.0, 0.0],
+        [0.0, 0.0],
+        [0.0, 0.0],
+        [0.0, 3.5],
+        [0.0, 3.5],
+        [2.8, 2.8],
+        [3.5, 0.0],
+        [0.0, 0.0],
+        [0.0, 0.0],
+        [0.0, 3.5],
+        [3.5, 0.0],
+        [2.8, 2.8],
+        [0.0, 3.5],
+        [0.0, 3.5],
+        [0.0, 0.0],
+    ]
+)
 
 print("JAX default backend:", jax.default_backend())
 print("JAX devices:", jax.devices())
@@ -25,8 +85,28 @@ print("JAX devices:", jax.devices())
 ### SOFT ROBOT UTILITIES FUNCTIONS ###
 
 
+def tendon_motion(state: SystemState):
+    """Smooth, nonnegative pulls followed by an unforced swing from 6.4 s."""
+    index = jnp.clip(
+        jnp.searchsorted(MOTION_TIMES, state.t, side="right") - 1,
+        0,
+        len(MOTION_TIMES) - 2,
+    )
+    phase = jnp.clip(
+        (state.t - MOTION_TIMES[index])
+        / (MOTION_TIMES[index + 1] - MOTION_TIMES[index]),
+        0.0,
+        1.0,
+    )
+    blend = phase**2 * (3.0 - 2.0 * phase)
+    tension = (1.0 - blend) * MOTION_TENSIONS[index] + blend * MOTION_TENSIONS[
+        index + 1
+    ]
+    return tension, None
+
+
 # STATIC EQUILIBRIUM EQUATION SOLVER
-def solve_equilibrium(robot: TendonActuatedGVS, u: jnp.ndarray, q0: jnp.ndarray):
+def solve_equilibrium(robot: GVS, u: jnp.ndarray, q0: jnp.ndarray):
     def statics_eq(q, args):
         u = args
         K = robot.stiffness_matrix()
@@ -50,36 +130,38 @@ jnp.set_printoptions(
 
 # 2 link version
 # Link 1
-link1 = LinkSpec(
-    cross_section_geometry=CrossSectionGeometry.CIRCULAR,
-    E=3.04e5,
-    nu=0.45,
-    rho=1310.0,
-    eta=1e4,
-    L=0.0250 + 0.2550 + 0.0250,
-    r_i=0.01541,
-    r_f=0.00642,
+link1 = LinkSpec.circular(
+    young_modulus=3.04e5,
+    shear_modulus=3.04e5 / 2.9,
+    density=1310.0,
+    material_damping_coefficient=MATERIAL_DAMPING,
+    length=0.0250 + 0.2550 + 0.0250,
+    radius=LinearProfile(0.01541, 0.00642),
+    reference_strain=[0, 0, 0, 1, 0, 0],
 )
 
 # Link 2
-link2 = LinkSpec(
-    cross_section_geometry=CrossSectionGeometry.CIRCULAR,
-    E=3.04e5,
-    nu=0.45,
-    rho=1310.0,
-    eta=1e4,
-    L=0.0550,
-    r_i=0.00642,
-    r_f=0.00480,
+link2 = LinkSpec.circular(
+    young_modulus=3.04e5,
+    shear_modulus=3.04e5 / 2.9,
+    density=1310.0,
+    material_damping_coefficient=MATERIAL_DAMPING,
+    length=0.0550,
+    radius=LinearProfile(0.00642, 0.00480),
+    reference_strain=[0, 0, 0, 1, 0, 0],
 )
 joint1 = JointSpec(type="fixed")
 joint2 = JointSpec(type="fixed")
 
 basis1 = StrainBasisSpec(
-    type="monomial", active=[1, 1, 1, 1, 0, 0], orders=[1, 1, 1, 1, 0, 0]
+    type="monomial",
+    strain_selector=[1, 1, 1, 1, 0, 0],
+    basis_order=[1, 1, 1, 1, 0, 0],
 )
 basis2 = StrainBasisSpec(
-    type="monomial", active=[0, 1, 1, 0, 0, 0], orders=[0, 0, 0, 0, 0, 0]
+    type="monomial",
+    strain_selector=[0, 1, 1, 0, 0, 0],
+    basis_order=[0, 0, 0, 0, 0, 0],
 )
 
 
@@ -87,42 +169,41 @@ num_gauss_points = [8, 8]
 g = [0.0, 0.0, -9.81]
 
 
-active_tendon_routing_params = {
-    "ry": jnp.array(
-        [0.0114 * jnp.cos(jnp.pi / 180 * 30), 0.0114 * jnp.cos(jnp.pi / 180 * 150)]
-    ),
-    "my": jnp.array(
-        [-0.0295 * jnp.cos(jnp.pi / 180 * 30), -0.0295 * jnp.cos(jnp.pi / 180 * 150)]
-    ),
-    "rz": jnp.array(
-        [0.0114 * jnp.sin(jnp.pi / 180 * 30), 0.0114 * jnp.sin(jnp.pi / 180 * 150)]
-    ),
-    "mz": jnp.array(
-        [-0.0295 * jnp.sin(jnp.pi / 180 * 30), -0.0295 * jnp.sin(jnp.pi / 180 * 150)]
-    ),
-    "idx_seg_att": jnp.array([0, 0]),
-}
+# Rotate the tendon pair a quarter turn around the hanging backbone so
+# alternating pulls swing along world X, across the camera's field of view.
+tendon_angles = jnp.deg2rad(jnp.array([120.0, 240.0]))
+tendon_directions = jnp.stack(
+    (jnp.zeros_like(tendon_angles), jnp.cos(tendon_angles), jnp.sin(tendon_angles)),
+    axis=-1,
+)
+active_tendon_routing = ThreadlikeRouting.linear(
+    intercept=0.0114 * tendon_directions,
+    slope=-0.0295 * tendon_directions,
+    start_segment_index=0,
+    end_segment_index=(0, 0),
+)
 # attention: 0DEG -> Y+, 180DEG -> Y-, 90DEG -> Z+, 270DEG -> Z-
 
-p0 = jnp.array([-jnp.pi / 2, jnp.pi / 2, jnp.pi / 2, 0.0, 0.0, 0.0])
+base_pose = poses.spatial_mounting_pose("hanging")
 
 # 2 link version
-robot = TendonActuatedGVS(
-    segments=[
-        GVSSegment(
-            link=link1, joint=joint1, basis=basis1, num_gauss_points=num_gauss_points[0]
-        ),
-        GVSSegment(
-            link=link2, joint=joint2, basis=basis2, num_gauss_points=num_gauss_points[1]
-        ),
-    ],
-    g=g,
-    active_tendon_routing_params=active_tendon_routing_params,
-    p0=p0,
+segments = [
+    GVSSegment(
+        link=link1, joint=joint1, basis=basis1, num_gauss_points=num_gauss_points[0]
+    ),
+    GVSSegment(
+        link=link2, joint=joint2, basis=basis2, num_gauss_points=num_gauss_points[1]
+    ),
+]
+robot = GVS.from_segments(
+    segments,
+    gravity=jnp.asarray(g),
+    base_pose=base_pose,
+    actuators=ThreadlikeActuator.tendons(active_tendon_routing),
     scale_rotational_basis_by_length=True,
 )
 # debug: check g0
-# g0_test = lie.exp_SE3(p0)
+# g0_test = poses.quaternion_pose_to_transform(base_pose)
 # print("g0_test:\n", g0_test[:3,:3])
 
 ### MATRICES CHECKING AND PRINTING ###
@@ -171,11 +252,11 @@ D = robot.damping_matrix(q0)
 B = robot.actuation_matrix(q0)
 C = robot.coriolis_matrix(q0, q0dot)
 
-u = jnp.asarray([-1, -0.00], dtype=q0.dtype)
+u = MOTION_TENSIONS[0].astype(q0.dtype)
 tau = robot.actuation_force(q0, u)
 
 
-print("body lengths per segment:", robot.segment_lengths)
+print("total body length:", robot.length)
 # print("L_cum:", L_cum)
 # print("total length:", total_length)
 print("s_end:", s_end)
@@ -196,7 +277,7 @@ print("g(s_end) SE(3):\n", g_end)
 # y = jnp.concatenate([q0, q0dot])
 tau_ext = 0 * jnp.ones((dof,))
 
-l_tendons = robot.tendon_length(q0)  # jax.Array (num_actuators,)
+l_tendons = robot.actuators[0].path_lengths(robot, q0)
 print("tendon lengths (m):", jax.device_get(l_tendons))
 
 
@@ -204,7 +285,32 @@ if Open3DRenderer is None:
     raise ImportError("Open3DRenderer is unavailable. Install open3d to run this.")
 
 # Create renderer for visualization
-renderer = Open3DRenderer(robot, num_points=50)
+renderer = Open3DRenderer(
+    robot,
+    config=RendererConfig(
+        # Match the single-tentacle color in the rendering preset gallery.
+        colors=RendererColorConfig(
+            backbone=BackboneColorConfig(
+                robot_colors=[(0.65, 0.38, 0.78)], segment_palette=None
+            ),
+            base_plate_color=(0.16, 0.18, 0.18),
+        ),
+        camera=CameraConfig(
+            fov=35,
+            position=(0.0, -0.70, -0.44),
+            look_at=(0.0, 0.0, -0.16),
+        ),
+        geometry=GeometryConfig(num_points=100, cross_section_resolution=32),
+        scene=SceneConfig.studio(
+            ground=GroundPlaneConfig(
+                grid=False,
+                color=(0.58, 0.58, 0.58),
+                height_reference="base_mounting_face",
+                normal=(0.0, 0.0, -1.0),
+            )
+        ),
+    ),
+)
 
 # =====================================================
 # Static equilibrium (solve statics) and plot its shape
@@ -224,16 +330,18 @@ renderer.show(q0)
 
 # Simulation time parameters
 t0 = 0.0
-t1 = 2.0
+t1 = 10.0  # Includes 3.6 seconds of passive swinging after the final release.
 solver_dt = 1e-4
-skip_step = 100  # how many time steps to skip in between video frames
+skip_step = 100  # Integration steps per saved sample (100 Hz).
 save_dt = solver_dt * skip_step
 
 
-initial_state = SystemState(t=t0, y=jnp.concatenate([q0, q0dot]))
-trajectory = robot.rollout_to(
+# Begin with stored elastic energy in a bent equilibrium. The time-dependent
+# controller supplies tensions only; all motion comes from the robot dynamics.
+initial_state = SystemState(t=t0, y=jnp.concatenate([q_stat, q0dot]))
+trajectory = robot.rollout_closed_loop_to(
     initial_state=initial_state,
-    u=u,
+    controller=tendon_motion,
     t1=t1,
     solver_dt=solver_dt,
     save_dt=save_dt,
@@ -302,6 +410,17 @@ p_marker_4_ts = g_marker_4_ts[:, :3, 3] + g_marker_4_ts[:, :3, :3] @ jnp.array(
 
 
 plt.figure()
+plt.plot(ts, trajectory.u[:, 0], label="Tendon 1")
+plt.plot(ts, trajectory.u[:, 1], label="Tendon 2")
+plt.axvspan(float(MOTION_TIMES[-1]), t1, color="gray", alpha=0.15, label="Free swing")
+plt.xlabel("Time [s]")
+plt.ylabel("Tendon tension [N]")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+plt.figure()
 plt.plot(ts, g_ee_ts[:, 0, 3], label="End-effector x [m]")
 plt.plot(ts, g_ee_ts[:, 1, 3], label="End-effector y [m]")
 plt.plot(ts, g_ee_ts[:, 2, 3], label="End-effector z [m]")
@@ -329,4 +448,11 @@ plt.show()
 # =====================================================
 # Plot the robot configuration upon time
 # =====================================================
-renderer.render_sequence(ts=ts, q_ts=q_ts, playback_speed=1.0)
+renderer.render_sequence(
+    ts=ts,
+    q_ts=q_ts,
+    playback_speed=1.0,
+    record_every_n=2,  # Export at 50 fps while retaining 100 Hz samples for plots.
+    record_path=str(VIDEO_OUTPUT),
+)
+print(f"Saved {VIDEO_OUTPUT}")

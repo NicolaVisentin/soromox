@@ -1,3 +1,4 @@
+# ruff: noqa: E402
 import jax
 
 jax.config.update("jax_enable_x64", True)  # double precision
@@ -6,7 +7,8 @@ import jax.numpy as jnp
 import pytest
 
 from soromox.control import ReferenceTrajectory
-from soromox.utils.rotations import RotationRepresentation
+from soromox.control.reference_trajectory import _make_interp_fn
+from soromox.utils.geometry.rotations import RotationRepresentation
 
 
 class TestReferenceTrajectoryFromDiscrete:
@@ -90,6 +92,25 @@ class TestReferenceTrajectoryFromDiscrete:
         assert ref.xdd_des_fn is not None
         assert ref.xdd_des_ts is not None
         assert ref.xdd_des_ts.shape == (10, 2)
+
+    def test_duplicate_timestamps_have_finite_values_and_derivatives(self):
+        """A zero interpolation interval must not leak ``0 / 0`` into autodiff."""
+        ts = jnp.array([0.0, 0.0, 1.0])
+        x_des_ts = jnp.array([[1.0, 2.0], [1.0, 2.0], [3.0, 4.0]])
+
+        ref = ReferenceTrajectory(ts=ts, x_des_ts=x_des_ts)
+
+        for fn in (ref.x_des_fn, ref.xd_des_fn, ref.xdd_des_fn):
+            assert jnp.isfinite(fn(jnp.array(0.0))).all()
+
+    def test_nonpositive_interpolation_intervals_do_not_interpolate(self):
+        """Non-increasing samples retain the existing left-value convention."""
+        ts = jnp.array([1.0, 0.0])
+        vals = jnp.array([[1.0], [0.0]])
+
+        interp_fn = _make_interp_fn(ts, vals)
+
+        assert jnp.allclose(interp_fn(0.5), vals[0])
 
 
 class TestReferenceTrajectoryFromContinuous:
@@ -277,7 +298,8 @@ class TestReferenceTrajectoryWithPoses:
             n_points=1,
         )
 
-        # For ROTATION_VECTOR, velocity ≈ d(pose)/dt
+        # Rotation about a fixed axis has angular velocity equal to the
+        # rotation-vector derivative.
         xd = ref.xd_des_fn(0.5)
         expected_xd = jnp.array([0.0, 0.0, 0.1, 0.0, 0.0, 0.05])
 
@@ -308,7 +330,8 @@ class TestReferenceTrajectoryWithPoses:
             n_points=1,
         )
 
-        # For ROTATION_VECTOR, velocity ≈ d(pose)/dt
+        # Rotation about a fixed axis has angular velocity equal to the
+        # rotation-vector derivative.
         xd = ref.xd_des_fn(0.5)
         expected_xd = jnp.array([0.0, 0.0, 0.1, 0.0, 0.0, 0.05])
 

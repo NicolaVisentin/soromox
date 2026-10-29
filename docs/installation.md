@@ -2,29 +2,26 @@
 
 **Get started with SoRoMoX in minutes!** Choose from multiple installation methods to get Soft Robot Models in jaX (SoRoMoX) running on your system.
 
-!!! warning "📢 Migration from JSRM"
-    
-    If you're migrating from the [JSRM package](https://github.com/tud-phi/jax-soft-robot-modeling), please note that SoRoMoX introduces breaking changes:
-    
-    - **Package Name**: `import jsrm` → `import soromox`
-    - **Architecture**: Functional approach → Object-oriented Equinox dataclasses
-    - **Performance**: Symbolic derivations → Numerical implementations
-    - **New Soft Robot Models**: Support for Spatial PCS, GVS, and articulated soft robot systems
-    - **Actuation**: Popular soft robot actuation modalities such as tendon-actuation and pneumatic-actuation are implemented into the models (instead of just direct-torque actuation like in JSRM)
-    - **Renderers**: SoRoMoX includes built-in renderers for visualization
-    - **Control**: Model-based control implementations are included
-
----
-
 ## 🔧 Requirements
 
 !!! note "System Requirements"
-    - **Python** >= 3.10
-    - **JAX** >= 0.4.0
-    - **NumPy** >= 1.21.0
+    - **Python** >= 3.11
+    - **JAX** >= 0.10.0
+    - **Diffrax** >= 0.7.2
+    - **NumPy**
 
 !!! warning "Python Version Compatibility"
-    - **Open3D Rendering**: Open3D rendering is currently not compatible with Python 3.13+
+    - **Python 3.15**: Use current numerical dependencies or the updated
+      repository lockfile. Until Python 3.15 final is released, CI uses the
+      available release candidate. Some rendering and test dependencies build
+      from source and require C/C++ and, for some packages, Rust build tools.
+    - **PyTorch extras on Python 3.15**: PyTorch currently has no 3.15 wheels.
+      The `cuda13`, `rl`, `paper_results`, and `all` extras include PyTorch
+      directly or through Stable-Baselines3. Core simulation and the `warp`
+      extra can be installed independently.
+    - **Open3D Rendering**: Patched Open3D 0.20 source builds are tested
+      with Python 3.11–3.14 on Ubuntu x86-64. Python 3.12–3.14 and 3.15.0rc2
+      are tested on Apple Silicon; Ubuntu CI also covers Python 3.15.
     - **Python 3.14 on Windows**: There may currently exist an incompatibility of Python 3.14 on Windows with the package
 
 ---
@@ -78,10 +75,10 @@ SoRoMoX provides several optional dependency groups for different use cases:
 
 ### 🎨 Rendering Dependencies
 
-For 3D visualization and animation:
+For 3D visualization and animation, install from a source checkout:
 
 ```bash
-pip install soromox[rendering]
+uv sync --extra rendering
 ```
 
 **Includes:**
@@ -90,10 +87,38 @@ pip install soromox[rendering]
 - `open3d` - High-quality 3D visualization
 - `viser` - Web-based interactive rendering
 - `opencv-python` - 2D rendering for planar robots
-- ``ffmpeg`` - Video encoding and processing
+
+!!! note "FFmpeg Video Encoding"
+    Video output uses the `ffmpeg` executable. Install FFmpeg separately with
+    your system package manager and ensure `ffmpeg` is available on `PATH`, for
+    example with `brew install ffmpeg` on macOS or `sudo apt install ffmpeg` on
+    Debian/Ubuntu. Some renderers fall back to image sequences or OpenCV video
+    encoding when FFmpeg is unavailable.
 
 !!! note "Open3D Compatibility"
-    Open3D rendering is currently not compatible with Python 3.13+. If you need 3D visualization, please use Python 3.12 or earlier, or use the `viser` renderer instead.
+    This checkout pins the immutable Open3D 0.20.0 release commit. On Ubuntu,
+    macOS, and Windows, `uv sync --extra rendering` builds the patched source
+    locally; the first build takes time and disk space. Ubuntu needs the
+    documented compiler, Vulkan, Xvfb, and FFmpeg packages. macOS needs Xcode
+    with its Metal Toolchain and Homebrew `cmake`, `ninja`, `openblas`,
+    `glslang`, and `spirv-cross`. See the
+    [build instructions](https://github.com/tud-phi/soromox/tree/main/third_party/open3d)
+    for prerequisites, environment variables, cache controls, validation commands,
+    and other platforms. On Ubuntu 26.04 x86-64, Python 3.11–3.14 pass real
+    Vulkan image and MP4 export plus modern and animated viewers under Xvfb.
+    Apple Silicon image, video, and modern-window checks pass with Python
+    3.12–3.14 and 3.15.0rc2. Native Windows builds are validated in CI. Plain
+    `pip install soromox[rendering]` uses PyPI and does not include the required
+    Open3D patches.
+
+    The patched Open3D source build is required for all supported Python
+    versions. In a source checkout, use `uv sync --extra rendering`, or install
+    the local build before the rendering extra with pip:
+
+    ```bash
+    python -m pip install ./third_party/open3d
+    python -m pip install -e ".[rendering]"
+    ```
 
 ### 📚 Examples Dependencies
 
@@ -105,7 +130,6 @@ pip install soromox[examples]
 
 **Includes:**
 
-- `ffmpeg-python` - Video encoding and processing
 - `ipython` - Enhanced interactive Python shell
 - `matplotlib` - Publication-ready plotting and visualization
 - `open3d` - High-quality 3D visualization
@@ -169,17 +193,16 @@ Test your installation with this quick verification script:
 
     ```python
     import jax.numpy as jnp
-    from soromox.systems import PlanarPCS
+    from soromox.systems import LinkSpec, PlanarPCS
 
     # Create a simple 1-segment PCS robot
-    num_segments = 1
-    strain_selector = jnp.ones((3 * num_segments,), dtype=bool)
-
-    # Initialize the system
-    _, forward_kinematics, _, _ = planar_pcs_num.factory(
-        num_segments, 
-        strain_selector
-    )
+    robot = PlanarPCS.from_links([LinkSpec.circular(
+        length=0.1, radius=0.01, density=1000.0,
+        young_modulus=1e6, shear_modulus=1e5,
+        material_damping_coefficient=318.0,
+        reference_strain=[0.0, 1.0, 0.0],
+    )])
+    robot.forward_kinematics(jnp.zeros(robot.num_coordinates), s=0.1)
 
     print("🎉 SoRoMoX installation successful!")
     ```
@@ -189,14 +212,23 @@ Test your installation with this quick verification script:
     ```python
     import jax
     import jax.numpy as jnp
-    from soromox.systems import PlanarPCS
-    from soromox.parameters import Params
+    from soromox.systems import LinkSpec, PlanarPCS
 
-    # Test JAX compilation and differentiation
+    robot = PlanarPCS.from_links([
+        LinkSpec.circular(
+            length=0.1, radius=0.01, density=1000.0,
+            young_modulus=1e6, shear_modulus=1e5,
+            material_damping_coefficient=318.0,
+            reference_strain=[0.0, 1.0, 0.0],
+        )
+        for _ in range(2)
+    ])
+
+    # Test JAX compilation and differentiation. Same-shape params updates keep
+    # the PyTree layout fixed and avoid recompilation.
     @jax.jit
     def test_function(q):
-        robot = PlanarPCS(num_segments=2, params=Params.default())
-        return robot.forward_kinematics(q, s=1.0)
+        return robot.forward_kinematics(q, s=0.2)
 
     # Test with sample configuration
     q = jnp.array([0.1, 0.0, 0.0, 0.1, 0.0, 0.0])
@@ -221,9 +253,9 @@ Test your installation with this quick verification script:
         
         **Problem:** `ImportError` or compatibility issues
         
-        **Solution:** Ensure you're using Python 3.10 or later:
+        **Solution:** Ensure you're using Python 3.11 or later:
         ```bash
-        python --version  # Should be >= 3.10
+        python --version  # Should be >= 3.11
         ```
 
     === "📦 JAX Installation"

@@ -1,33 +1,139 @@
-import jax
-
-jax.config.update("jax_enable_x64", True)  # double precision
+# ruff: noqa: E402
 from pathlib import Path
 
-from jax import jacfwd, grad
+import equinox as eqx
+import jax
+import numpy as np
+import pytest
+
+jax.config.update("jax_enable_x64", True)  # double precision
+
+from jax import grad, jacfwd, random
 from jax import numpy as jnp
-from jax import random
+from jax.scipy.linalg import expm
+from numpy.testing import assert_allclose
 
-import soromox
-from soromox.parameters.hsa_params import PARAMS_FPU_CONTROL as params
-from soromox.systems import PlanarHSA
+from soromox.systems import PlanarHSA, PlanarHSAParams, PlanarHSAStructure
+from soromox.utils.geometry import poses
+from soromox.utils.lie_algebra import se2
 
+HSA_PARAMS_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "assets"
+    / "robot_parameters"
+    / "planar_hsa"
+    / "fpu_control.npz"
+)
+typed_params = PlanarHSAParams.from_npz(HSA_PARAMS_PATH)
 num_segments = 1
 num_rods_per_segment = 2
-
-# filepath to symbolic expressions
-sym_exp_filepath = (
-    Path(soromox.__file__).parent
-    / "symbolic_expressions"
-    / f"planar_hsa_ns-{num_segments}_nrs-{num_rods_per_segment}.dill"
-)
 
 
 def _create_robot():
     """Helper to create a robot instance."""
     return PlanarHSA(
-        sym_exp_filepath=sym_exp_filepath,
-        params=params,
+        params=typed_params,
+        structure=PlanarHSAStructure(),
+        base_pose=jnp.zeros((3,), dtype=jnp.float64),
     )
+
+
+def _updated_typed_params():
+    return typed_params.replace(
+        gravity=typed_params.gravity.at[1].set(-9.7),
+        length=1.01 * typed_params.length,
+        rod_density=1.02 * typed_params.rod_density,
+        nominal_bending_stiffness=1.03 * typed_params.nominal_bending_stiffness,
+        bending_damping=1.04 * typed_params.bending_damping,
+    )
+
+
+def _parameter_runtime_summary(robot):
+    return jnp.concatenate(
+        [
+            robot.fixed_base_pose,
+            robot.g,
+            robot.L,
+            robot.rod_density.reshape(-1),
+            robot.K_full.reshape(-1),
+            robot.D_full.reshape(-1),
+        ]
+    )
+
+
+def test_planar_hsa_parameter_updates_are_immutable_and_refresh_eager_caches():
+    robot = _create_robot()
+    updated_params = _updated_typed_params()
+    before = _parameter_runtime_summary(robot)
+
+    updated = robot.with_params(updated_params)
+
+    assert_allclose(_parameter_runtime_summary(robot), before)
+    assert not jnp.allclose(_parameter_runtime_summary(updated), before)
+
+
+def test_velocity_bias_matches_euler_lagrange_kinetic_energy():
+    """Verify the complete bias vector with the HSA's offset mass distribution."""
+    robot = _create_robot()
+    q = jnp.linspace(-0.15, 0.2, robot.num_coordinates)
+    velocity = jnp.linspace(0.3, -0.2, robot.num_velocities)
+    mass_dot = jax.jvp(robot.inertia_matrix, (q,), (velocity,))[1]
+    kinetic_gradient = jax.grad(
+        lambda coordinates: (
+            0.5 * velocity @ robot.inertia_matrix(coordinates) @ velocity
+        )
+    )(q)
+    expected = mass_dot @ velocity - kinetic_gradient
+
+    _, bias, _ = robot.dynamics_terms(q, velocity)
+
+    assert_allclose(bias, expected, rtol=1e-9, atol=1e-11)
+
+
+def test_planar_hsa_same_structure_parameter_updates_compile_once():
+    robot = _create_robot()
+    updated_params = _updated_typed_params()
+    trace_count = {"value": 0}
+
+    @eqx.filter_jit
+    def compiled_summary(current_params):
+        trace_count["value"] += 1
+        return _parameter_runtime_summary(robot.with_params(current_params))
+
+    baseline = compiled_summary(typed_params)
+    actual = compiled_summary(updated_params)
+
+    assert trace_count["value"] == 1
+    assert not jnp.allclose(actual, baseline)
+    assert_allclose(
+        actual, _parameter_runtime_summary(robot.with_params(updated_params))
+    )
+
+
+def test_planar_hsa_parameter_gradient_passes_through_compiled_update():
+    robot = _create_robot()
+
+    @eqx.filter_jit
+    def mass_summary(rod_density):
+        current = typed_params.replace(rod_density=rod_density)
+        return jnp.sum(robot.with_params(current).rod_mass_matrices)
+
+    gradient = jax.grad(mass_summary)(typed_params.rod_density)
+
+    assert gradient.shape == typed_params.rod_density.shape
+    assert jnp.all(jnp.isfinite(gradient))
+    assert jnp.any(gradient != 0.0)
+
+
+def test_planar_hsa_parameter_structure_changes_require_reconstruction():
+    wrong_shape = eqx.tree_at(
+        lambda params: params.length,
+        typed_params,
+        jnp.ones((2,), dtype=jnp.float64),
+    )
+
+    with pytest.raises(ValueError, match="shape|structure|construct"):
+        _create_robot().with_params(wrong_shape)
 
 
 def _sample_configuration(rng, num_segments):
@@ -36,8 +142,8 @@ def _sample_configuration(rng, num_segments):
     kappa_b = random.uniform(
         subrng1,
         (num_segments,),
-        minval=-jnp.pi / jnp.mean(params["L"]),
-        maxval=jnp.pi / jnp.mean(params["L"]),
+        minval=-jnp.pi / jnp.mean(typed_params.length),
+        maxval=jnp.pi / jnp.mean(typed_params.length),
     )
     sigma_sh = random.uniform(subrng2, (num_segments,), minval=-0.2, maxval=0.2)
     sigma_a = random.uniform(subrng3, (num_segments,), minval=0.0, maxval=0.5)
@@ -58,7 +164,7 @@ def test_end_effector_kinematics(seed: int = 0):
         # forward kinematics
         chiee = robot.forward_kinematics_end_effector(q)
         # inverse kinematics
-        q_rec = robot.inverse_kinematics_end_effector(chiee)
+        q_rec = robot.inverse_kinematics(chiee)
 
         if not jnp.allclose(q, q_rec, atol=1e-6):
             print("q = ", q)
@@ -66,11 +172,83 @@ def test_end_effector_kinematics(seed: int = 0):
             raise ValueError("q != q_rec")
 
 
-def test_jacobian_virtual_backbone(seed: int = 0):
+def test_inverse_kinematics_is_reverse_mode_finite_when_straight():
+    """Cover the analytic straight branch where ``cos(theta) - 1`` is zero."""
+    robot = _create_robot()
+    q = jnp.zeros(robot.num_internal_dofs)
+    chiee = robot.forward_kinematics_end_effector(q)
+
+    recovered = robot.inverse_kinematics(chiee)
+    jacobian = jax.jacrev(robot.inverse_kinematics)(chiee)
+
+    assert jnp.isfinite(recovered).all()
+    assert jnp.isfinite(jacobian).all()
+
+
+def test_inverse_kinematics_retains_translation_at_tiny_nonzero_rotation():
+    """Tiny bends must not lose translation through ``1 - cos(theta)``."""
+    robot = _create_robot()
+    theta = jnp.asarray(2.0 * robot.global_eps, dtype=jnp.float64)
+    expected_vxi = jnp.array([theta / robot.length, 0.2, 1.1], dtype=jnp.float64)
+    T_pe_to_de = expm(se2.hat(expected_vxi * robot.length))
+
+    hp = robot.platform_dimension[0, 1]
+    T_b_to_pe = poses.planar_pose_to_transform(
+        jnp.array([0.0, 0.0, robot.proximal_cap_length[0]])
+    )
+    T_de_to_ee = poses.planar_pose_to_transform(
+        jnp.array(
+            [
+                robot.end_effector_offset[0],
+                robot.end_effector_offset[1],
+                robot.distal_cap_length[0] + hp + robot.end_effector_offset[2],
+            ]
+        )
+    )
+    chiee = poses.planar_pose_from_transform(
+        T_b_to_pe @ T_pe_to_de @ T_de_to_ee, eps=robot.global_eps
+    )
+
+    recovered_q = robot.inverse_kinematics(chiee)
+    recovered_vxi = robot.B_xi @ recovered_q + robot.xi_ref
+
+    assert_allclose(recovered_vxi, expected_vxi, rtol=1e-10, atol=1e-11)
+
+
+def test_planar_hsa_archive_uses_descriptive_parameter_names():
+    robot = _create_robot()
+
+    with np.load(HSA_PARAMS_PATH) as data:
+        assert str(data["schema_version"]) == "planar_hsa_params_v2"
+        assert str(data["robot_name"]) == "PlanarHSA"
+        assert "xi_ref" not in data
+        assert jnp.allclose(typed_params.reference_strain, data["reference_strain"])
+        assert jnp.allclose(typed_params.phi_max, data["phi_max"])
+    assert jnp.allclose(robot.phi_max, typed_params.phi_max)
+
+
+def test_planar_hsa_npz_uses_environment_defaults_when_fields_are_absent(tmp_path):
+    with np.load(HSA_PARAMS_PATH) as data:
+        values = {
+            name: data[name]
+            for name in data.files
+            if name not in {"base_pose", "gravity"}
+        }
+    path = tmp_path / "hsa_without_environment.npz"
+    np.savez(path, **values)
+
+    params = PlanarHSAParams.from_npz(path)
+
+    robot = PlanarHSA(params=params, structure=PlanarHSAStructure())
+    assert jnp.allclose(robot.fixed_base_pose, jnp.array([jnp.pi / 2, 0.0, 0.0]))
+    assert jnp.allclose(params.gravity, jnp.array([0.0, -9.81]))
+
+
+def test_jacobian_matches_forward_kinematics_derivative(seed: int = 0):
     """
-    Test that the symbolic Jacobian matches the autograd Jacobian of forward kinematics.
+    Test that the numerical Jacobian matches the autograd Jacobian of forward kinematics.
     """
-    print("Testing jacobian_virtual_backbone...")
+    print("Testing analytic Jacobian...")
     robot = _create_robot()
 
     rng = random.PRNGKey(seed)
@@ -79,41 +257,41 @@ def test_jacobian_virtual_backbone(seed: int = 0):
 
         # Test at multiple points along the robot
         rng, subrng = random.split(rng)
-        s_values = random.uniform(subrng, (5,), minval=0.0, maxval=robot.Lmax)
+        s_values = random.uniform(subrng, (5,), minval=0.0, maxval=robot.length)
 
         for s in s_values:
-            # Symbolic Jacobian
-            J_sym = robot.jacobian_virtual_backbone(q, s)
+            # Numerical Jacobian
+            J_analytic = robot.jacobian(q, s)
 
             # Autograd Jacobian (computed from forward_kinematics)
-            J_autograd = jacfwd(robot.forward_kinematics_virtual_backbone, argnums=0)(
-                q, s
-            )
+            J_autograd = jacfwd(robot.forward_kinematics, argnums=0)(q, s)
 
-            if not jnp.allclose(J_sym, J_autograd, atol=1e-6):
+            if not jnp.allclose(J_analytic, J_autograd, atol=1e-6):
                 print(f"s = {s}")
-                print(f"J_sym =\n{J_sym}")
+                print(f"J_analytic =\n{J_analytic}")
                 print(f"J_autograd =\n{J_autograd}")
-                print(f"diff =\n{J_sym - J_autograd}")
-                raise ValueError("Symbolic Jacobian does not match autograd Jacobian")
+                print(f"diff =\n{J_analytic - J_autograd}")
+                raise ValueError(
+                    "Analytic Jacobian does not match forward-kinematics derivative"
+                )
 
 
-def test_jacobian_alias(seed: int = 0):
+def test_jacobian_matches_base_system_api(seed: int = 0):
     """
-    Test that jacobian is an alias for jacobian_virtual_backbone.
+    Test the standard SoftRobot Jacobian API.
     """
-    print("Testing jacobian alias...")
+    print("Testing jacobian wrapper...")
     robot = _create_robot()
 
     rng = random.PRNGKey(seed)
     rng, q = _sample_configuration(rng, num_segments)
     rng, subrng = random.split(rng)
-    s = random.uniform(subrng, (), minval=0.0, maxval=robot.Lmax)
+    s = random.uniform(subrng, (), minval=0.0, maxval=robot.length)
 
     J1 = robot.jacobian(q, s)
-    J2 = robot.jacobian_virtual_backbone(q, s)
+    J2 = robot._jacobian(q, s)
 
-    assert jnp.allclose(J1, J2, atol=1e-12), "jacobian should be alias of jacobian_virtual_backbone"
+    assert jnp.allclose(J1, J2, atol=1e-12), "jacobian should use the analytic hook"
 
 
 def test_jacobian_tips(seed: int = 0):
@@ -128,18 +306,18 @@ def test_jacobian_tips(seed: int = 0):
 
     s_tips = robot.L_cum[1:]
     J_tips = robot.jacobian_tips(q)
-    J_expected = robot.jacobian_batched(q, s_tips)
+    J_expected = robot.jacobian_abscissa_batched(q, s_tips)
 
     assert jnp.allclose(J_tips, J_expected, atol=1e-12), (
-        "jacobian_tips should match jacobian_batched at segment tips"
+        "jacobian_tips should match jacobian_abscissa_batched at segment tips"
     )
 
 
-def test_jacobian_and_derivative_virtual_backbone(seed: int = 0):
+def test_jacobian_and_time_derivative(seed: int = 0):
     """
     Test the Jacobian and its time derivative.
     """
-    print("Testing jacobian_and_derivative_virtual_backbone...")
+    print("Testing analytic Jacobian time derivative...")
     robot = _create_robot()
 
     rng = random.PRNGKey(seed)
@@ -149,18 +327,22 @@ def test_jacobian_and_derivative_virtual_backbone(seed: int = 0):
         qd = random.normal(subrng, shape=q.shape) * 0.1
 
         rng, subrng = random.split(rng)
-        s = random.uniform(subrng, (), minval=0.1 * robot.Lmax, maxval=0.9 * robot.Lmax)
+        s = random.uniform(
+            subrng, (), minval=0.1 * robot.length, maxval=0.9 * robot.length
+        )
 
-        J, Jd = robot.jacobian_and_derivative_virtual_backbone(q, qd, s)
+        J, Jd = robot.jacobian_and_time_derivative(q, qd, s)
 
         # Verify J matches the Jacobian method
-        J_direct = robot.jacobian_virtual_backbone(q, s)
-        assert jnp.allclose(J, J_direct, atol=1e-10), "J from jacobian_and_derivative should match jacobian"
+        J_direct = robot.jacobian(q, s)
+        assert jnp.allclose(J, J_direct, atol=1e-10), (
+            "J from jacobian_and_time_derivative should match jacobian"
+        )
 
         # Verify Jd by numerical differentiation
         eps_t = 1e-6
         q_plus = q + eps_t * qd
-        J_plus = robot.jacobian_virtual_backbone(q_plus, s)
+        J_plus = robot.jacobian(q_plus, s)
         Jd_numerical = (J_plus - J) / eps_t
 
         if not jnp.allclose(Jd, Jd_numerical, atol=1e-4):
@@ -170,11 +352,11 @@ def test_jacobian_and_derivative_virtual_backbone(seed: int = 0):
             raise ValueError("Jd does not match numerical derivative")
 
 
-def test_jacobian_and_derivative_alias(seed: int = 0):
+def test_jacobian_and_time_derivative_matches_analytic_hook(seed: int = 0):
     """
-    Test that jacobian_and_derivative is an alias for jacobian_and_derivative_virtual_backbone.
+    Test that the standard derivative API uses the analytic hook.
     """
-    print("Testing jacobian_and_derivative alias...")
+    print("Testing jacobian_and_time_derivative wrapper...")
     robot = _create_robot()
 
     rng = random.PRNGKey(seed)
@@ -182,13 +364,17 @@ def test_jacobian_and_derivative_alias(seed: int = 0):
     rng, subrng = random.split(rng)
     qd = random.normal(subrng, shape=q.shape) * 0.1
     rng, subrng = random.split(rng)
-    s = random.uniform(subrng, (), minval=0.0, maxval=robot.Lmax)
+    s = random.uniform(subrng, (), minval=0.0, maxval=robot.length)
 
-    J1, Jd1 = robot.jacobian_and_derivative(q, qd, s)
-    J2, Jd2 = robot.jacobian_and_derivative_virtual_backbone(q, qd, s)
+    J1, Jd1 = robot.jacobian_and_time_derivative(q, qd, s)
+    J2, Jd2 = robot._jacobian_and_time_derivative(q, qd, s)
 
-    assert jnp.allclose(J1, J2, atol=1e-12), "jacobian_and_derivative J should match"
-    assert jnp.allclose(Jd1, Jd2, atol=1e-12), "jacobian_and_derivative Jd should match"
+    assert jnp.allclose(J1, J2, atol=1e-12), (
+        "jacobian_and_time_derivative J should match"
+    )
+    assert jnp.allclose(Jd1, Jd2, atol=1e-12), (
+        "jacobian_and_time_derivative Jd should match"
+    )
 
 
 def test_gravitational_energy(seed: int = 0):
@@ -203,9 +389,6 @@ def test_gravitational_energy(seed: int = 0):
     for _ in range(5):
         rng, q = _sample_configuration(rng, num_segments)
 
-        # Compute gravitational energy
-        U_g = robot.gravitational_energy(q)
-
         # Compute gravitational force
         G = robot.gravitational_force(q)
 
@@ -217,7 +400,18 @@ def test_gravitational_energy(seed: int = 0):
             print(f"G = {G}")
             print(f"G_from_energy = {G_from_energy}")
             print(f"diff = {jnp.abs(G - G_from_energy)}")
-            raise ValueError("Gravitational force should be gradient of gravitational energy")
+            raise ValueError(
+                "Gravitational force should be gradient of gravitational energy"
+            )
+
+
+def test_rotated_fixed_base_gravity_matches_raw_potential_gradient() -> None:
+    robot = _create_robot().with_fixed_base_pose(jnp.array([0.73, 0.03, -0.02]))
+    q = jnp.array([-0.1, 0.02, 0.1])
+
+    dU_dq = grad(robot._gravitational_energy)(q)
+
+    assert_allclose(dU_dq, robot.gravitational_force(q), rtol=1e-9, atol=1e-11)
 
 
 def test_kinetic_energy(seed: int = 0):
@@ -247,7 +441,9 @@ def test_kinetic_energy(seed: int = 0):
 
         # Zero velocity should give zero kinetic energy
         T_zero = robot.kinetic_energy(q, jnp.zeros_like(qd))
-        assert jnp.abs(T_zero) < 1e-15, "Kinetic energy with zero velocity should be zero"
+        assert jnp.abs(T_zero) < 1e-15, (
+            "Kinetic energy with zero velocity should be zero"
+        )
 
 
 def test_elastic_energy(seed: int = 0):
@@ -278,6 +474,29 @@ def test_elastic_energy(seed: int = 0):
         assert jnp.abs(U_K_zero) < 1e-15, "Elastic energy at zero config should be zero"
 
 
+def test_elastic_force_matches_elastic_energy_gradient(seed: int = 0):
+    """
+    Test that elastic_force is the conservative gradient of elastic_energy.
+    """
+    print("Testing elastic_force gradient...")
+    robot = _create_robot()
+
+    rng = random.PRNGKey(seed)
+    for _ in range(5):
+        rng, q = _sample_configuration(rng, num_segments)
+
+        force = robot.elastic_force(q)
+        force_from_primal = grad(lambda q_: robot._elastic_energy(q_))(q)
+        force_from_public = grad(lambda q_: robot.elastic_energy(q_))(q)
+
+        assert jnp.allclose(force, force_from_primal, atol=1e-10), (
+            "elastic_force should match the primal elastic-energy gradient"
+        )
+        assert jnp.allclose(force, force_from_public, atol=1e-10), (
+            "elastic_energy custom JVP should use elastic_force"
+        )
+
+
 def test_stiffness_matrix(seed: int = 0):
     """
     Test the stiffness matrix computation.
@@ -292,7 +511,9 @@ def test_stiffness_matrix(seed: int = 0):
 
     # Stiffness matrix should be positive semi-definite
     eigenvalues = jnp.linalg.eigvalsh(K)
-    assert jnp.all(eigenvalues >= -1e-10), "Stiffness matrix should be positive semi-definite"
+    assert jnp.all(eigenvalues >= -1e-10), (
+        "Stiffness matrix should be positive semi-definite"
+    )
 
 
 def test_potential_energy(seed: int = 0):
@@ -310,7 +531,9 @@ def test_potential_energy(seed: int = 0):
         U_K = robot.elastic_energy(q)
         U_G = robot.gravitational_energy(q)
 
-        assert jnp.allclose(U, U_K + U_G, atol=1e-10), "Potential energy should be U_K + U_G"
+        assert jnp.allclose(U, U_K + U_G, atol=1e-10), (
+            "Potential energy should be U_K + U_G"
+        )
 
 
 def test_total_energy(seed: int = 0):
@@ -335,10 +558,10 @@ def test_total_energy(seed: int = 0):
 
 if __name__ == "__main__":
     test_end_effector_kinematics()
-    test_jacobian_virtual_backbone()
-    test_jacobian_alias()
-    test_jacobian_and_derivative_virtual_backbone()
-    test_jacobian_and_derivative_alias()
+    test_jacobian_matches_forward_kinematics_derivative()
+    test_jacobian_matches_base_system_api()
+    test_jacobian_and_time_derivative()
+    test_jacobian_and_time_derivative_matches_analytic_hook()
     test_gravitational_energy()
     test_kinetic_energy()
     test_elastic_energy()

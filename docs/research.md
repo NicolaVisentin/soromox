@@ -1,0 +1,208 @@
+# Paper & Results
+
+SoRoMoX is presented in
+**[“SoRoMoX: Fast, Differentiable, and Parallelizable Soft Robot Models”](https://arxiv.org/abs/2608.06650)**.
+
+!!! quote "Using SoRoMoX in research?"
+
+    The [Citation](citation.md) guide provides the recommended paper
+    BibTeX, an exact-version software citation, and model- or
+    controller-specific references.
+
+## Paper overview
+
+The paper's primary contribution is a fully numerical, JIT-compilable
+Python/JAX implementation of control-oriented models for articulated and
+continuum soft robots. SoRoMoX implements articulated soft-robot,
+piecewise-constant strain (PCS), and geometric variable strain (GVS) models
+through one interface for kinematics, dynamics, energies, Jacobians and
+derivatives, actuation maps, and forward dynamics.
+
+Because the numerical core is JAX-native, these model computations can be
+JIT-compiled, automatically differentiated with respect to states, inputs, and
+physical parameters, vectorized, and executed on CPUs, GPUs, and TPUs.
+Model-based controllers and rendering backends are supporting contributions
+built around this model layer.
+
+<figure markdown>
+  ![Overview of SoRoMoX model families, JAX-native numerical infrastructure, and application case studies](assets/paper/soromox-overview.png){ .soromox-figure .soromox-figure--overview .soromox-figure--transparent }
+  <figcaption>SoRoMoX brings control-oriented articulated, PCS, and GVS models into the JAX computational stack.</figcaption>
+</figure>
+
+## Model evaluation
+
+### Sequential CPU rollouts
+
+The paper reports wall-clock time for three seconds of simulated motion on an
+Intel Core Ultra 7 165H CPU with 16 GB RAM. SoRoMoX is up to 27.0× faster than
+SoRoSim across the four cases:
+
+| Case | PyElastica (s) | SoRoSim (s) | SoRoMoX (s) | Speedup over SoRoSim |
+| --- | ---: | ---: | ---: | ---: |
+| Planar PCS | 2.25 | 75.73 | 2.81 | 27.0× |
+| Spatial PCS | 2.45 | 78.65 | 6.53 | 12.0× |
+| Spatial GVS | — | 55.54 | 10.63 | 5.2× |
+| Tendon-driven GVS | 11.40 | 75.80 | 11.72 | 6.5× |
+
+The case labels describe the strain-based models in SoRoMoX and SoRoSim, which
+use two piecewise elements. PyElastica uses a discrete Cosserat-rod model with
+10–100 elements. SoRoSim uses MATLAB's adaptive `ode45` solver; SoRoMoX uses
+`Tsit5` with a fixed 0.1 ms step. PyElastica uses the second-order symplectic
+`PositionVerlet` solver with the same fixed step size.
+
+The paper also compares SoRoSim and SoRoMoX tip positions at identical saved
+timestamps, without temporal or phase alignment:
+
+| Case | Tip-position RMSE (mm) | RMSE / beam length (%) |
+| --- | ---: | ---: |
+| Planar PCS | 2.75 | 0.46 |
+| Spatial PCS | 7.21 | 1.20 |
+| Spatial GVS | 0.86 | 0.14 |
+| Tendon-driven GVS | 5.82 | 0.97 |
+
+These RMSE values correspond to 0.14–1.20% of the 0.6 m beam length. The largest
+instantaneous tip-position difference is 14.14 mm for spatial PCS.
+See the [CPU benchmark reproduction instructions](https://github.com/tud-phi/soromox/tree/main/paper_results/secIVa_benchmarking_sequential_cpu)
+for the simulation scripts, saved trajectories, and plotting command.
+
+### Batched GPU rollouts
+
+<figure markdown>
+  ![GPU batch simulation throughput through 1,024 parallel environments for articulated, PCS, and GVS models](assets/paper/gpu-batch-scaling.png){ .soromox-figure .soromox-figure--plot }
+  <figcaption>On the reported RTX 5090 benchmark, scaling the leading batch size from 1 to 1,024 raises GVS simulation throughput by up to 679.7×.</figcaption>
+</figure>
+
+The exact scaling depends on the model, number of links or segments, hardware,
+and discretization. In this FP64 run, automatic backend selection resolves to
+Warp for GVS. At batch size 1,024, GVS reaches 679.7× the single-environment
+throughput for one segment and 133.6× for 32 segments. Throughput increases
+monotonically through batch size 1,024 for the GVS cases with 1, 2, 4, 8, or 16
+segments; the 32-segment case peaks at batch size 512 and is 1.2% lower at
+1,024.
+
+## Application case studies
+
+<figure markdown>
+  ![Block diagram of the six application case studies: parameter identification, residual learning, model-based control, gain optimization, safety constraints, and parallel reinforcement learning](assets/paper/application-workflows.png){ .soromox-figure .soromox-figure--overview }
+  <figcaption>The six application case studies reported in the paper.</figcaption>
+</figure>
+
+### 1. Static-equilibrium system identification
+
+This study differentiates through a two-link GVS model to identify Young's
+modulus, Poisson's ratio, and mass density from static marker measurements of a
+conical tendon-driven arm. Optimizing the physical parameters reduces the
+aggregate marker-position RMSE from 56.9 mm to 19.3 mm, an improvement of about
+66%.
+
+### 2. Residual-force learning
+
+Using the same differentiable static-equilibrium model, the study first
+estimates input-dependent residual generalized forces and then trains a neural
+network to predict them. The optimized and learned residuals reduce the overall
+marker RMSE to 6.6 mm and 6.9 mm, respectively.
+
+<figure markdown>
+  ![Overall marker-position error for initial parameters, identified physical parameters, optimized residual forces, and neural-network-predicted residual forces](assets/paper/identification-residual-learning.png){ .soromox-figure .soromox-figure--compact }
+  <figcaption>Shared result from the paper's static-equilibrium identification and residual-learning studies.</figcaption>
+</figure>
+
+### 3. Model-based control
+
+This study exercises the quantities exposed by the common model interface. A
+one-segment spatial PCS robot compares model-free PD/PID control with potential,
+feedforward, and computed-torque compensation; a fully actuated two-segment PCS
+robot tracks a spherical figure-eight pose trajectory with operational-space
+impedance control. The operational-space example reports 2.84 mm position RMSE
+and 2.29° orientation RMSE.
+
+<figure markdown>
+  ![Configuration-space and operational-space model-based control results for spatial PCS robots](assets/paper/model-based-control-results.png){ .soromox-figure .soromox-figure--wide }
+  <figcaption>Paper results for configuration-space regulation/tracking and operational-space pose tracking.</figcaption>
+</figure>
+
+<!-- Poster paths are relative to the generated /research/ page; Zensical does not rewrite this attribute. -->
+<video class="soromox-video" controls muted loop playsinline preload="metadata" poster="../assets/paper/model-based-control-poster.jpg" aria-label="Operational-space model-based control demonstration">
+  <source src="assets/paper/model-based-control.mp4" type="video/mp4">
+  Your browser does not support embedded video.
+</video>
+
+[Watch the MP4](assets/paper/model-based-control.mp4) · [View the animated GIF](assets/paper/model-based-control.gif)
+
+### 4. Control-gain optimization
+
+Gradients are propagated through full closed-loop rollouts while six gain
+initializations are evaluated in parallel. For actuation-space and
+operational-space control, the optimized losses decrease by 47% and 99%,
+respectively, relative to their initial median values.
+
+<figure markdown>
+  ![Loss convergence and closed-loop responses for actuation-space and operational-space controller-gain optimization](assets/paper/control-gain-optimization.png){ .soromox-figure .soromox-figure--wide }
+  <figcaption>Paper results for batched, differentiable control-gain optimization.</figcaption>
+</figure>
+
+### 5. Safety-constrained control
+
+The safety study uses differentiable PCS kinematics and dynamics to formulate
+high-order control Lyapunov and control barrier function constraints. The
+safety-unaware controller reaches about 33.5 N of pairwise normal force. The
+HOCBF-constrained controller stays at or below the prescribed 5 N limit while
+accepting a larger final goal distance.
+
+The video shows the HOCBF-constrained controller approaching the green goal
+among the purple obstacles.
+
+<video class="soromox-video" controls muted loop playsinline preload="metadata" poster="../assets/paper/safety-constrained-control-poster.jpg" aria-label="HOCBF-constrained soft robot approaching a goal among obstacles">
+  <source src="assets/paper/safety-constrained-control.mp4" type="video/mp4">
+  Your browser does not support embedded video.
+</video>
+
+[Watch the MP4](assets/paper/safety-constrained-control.mp4) · [View the animated GIF](assets/paper/safety-constrained-control.gif)
+
+### 6. Parallel reinforcement learning
+
+The final study vectorizes tendon-driven PCS environments on a GPU for PPO
+training. The trained policy reaches a 6.19 mm final mean tracking error and a
+91.4% step-wise success rate. The reported 4× and 7× training speedups at 256
+and 512 environments relative to the CPU PyElastica baseline jointly reflect
+model formulation, JIT compilation, hardware acceleration, and rollout
+parallelization.
+
+The video shows the trained policy tracking the green target in one environment.
+
+<video class="soromox-video" controls muted loop playsinline preload="metadata" poster="../assets/paper/parallel-rl-poster.jpg" aria-label="Trained reinforcement-learning policy tracking a target in one soft-robot environment">
+  <source src="assets/paper/parallel-rl.mp4" type="video/mp4">
+  Your browser does not support embedded video.
+</video>
+
+[Watch the MP4](assets/paper/parallel-rl.mp4) · [View the animated GIF](assets/paper/parallel-rl.gif)
+
+SoRoMoX can roll out many soft-robot environments in parallel, accelerating the
+experience collection that dominates reinforcement-learning training. The
+20 second animation below visualizes a trained policy acting simultaneously in
+64 independently simulated environments, with each robot rendered as a swept
+surface.
+
+<video class="soromox-video" controls muted loop playsinline preload="metadata" poster="../assets/paper/parallel-rl-trained-64-envs-poster.jpg" aria-label="Trained reinforcement-learning policy in 64 parallel soft-robot environments">
+  <source src="assets/paper/parallel-rl-trained-64-envs.mp4" type="video/mp4">
+  Your browser does not support embedded video.
+</video>
+
+[Watch the MP4](assets/paper/parallel-rl-trained-64-envs.mp4) · [View the animated GIF](assets/paper/parallel-rl-trained-64-envs.gif)
+
+## Reproducing the results
+
+The [`paper_results/`](https://github.com/tud-phi/soromox/tree/main/paper_results)
+directory contains experiment entry points, canonical outputs, and
+workflow-specific notes. Install its dependencies from an editable checkout:
+
+```bash
+python -m pip install -e ".[paper_results]"
+```
+
+Start with the README nearest to the experiment you want to reproduce. Record
+the SoRoMoX version, hardware, solver configuration, and random seed with new
+results. For package setup, see [Installation](installation.md).
+
+If you publish work based on these models or results, follow the
+[Citation](citation.md) guide.

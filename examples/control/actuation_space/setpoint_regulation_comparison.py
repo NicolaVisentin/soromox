@@ -21,14 +21,24 @@ the open-loop system with constant tendon tensions until steady-state, then use
 the final configuration as the setpoint for the closed-loop regulation.
 """
 
+import argparse
 import warnings
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 
+from soromox.rendering.config import (
+    GeometryConfig,
+    GroundPlaneConfig,
+    RendererConfig,
+    SceneConfig,
+)
+
 jax.config.update("jax_enable_x64", True)  # Double precision
 
+from soromox.actuation import ThreadlikeActuator, ThreadlikeRouting
 from soromox.control import PIDControl, PIDControllerState, ReferenceTrajectory
 from soromox.control.actuation_space import (
     GravityCancellationRegulator,
@@ -38,10 +48,18 @@ from soromox.control.actuation_space import (
 )
 from soromox.coordinate_transformations.actuation_space import ActuationSpaceDynamics
 from soromox.rendering import Open3DRenderer
-from soromox.systems import SystemState, TendonActuatedPCS
+from soromox.systems import (
+    PCS,
+    LinkSpec,
+    SystemState,
+)
+from soromox.utils.geometry import poses
+
+FIGURES_DIR = Path(__file__).resolve().parent / "figures"
+VIDEO_OUTPUT = Path(__file__).resolve().parent / "videos" / f"{Path(__file__).stem}.mp4"
 
 
-def create_robot() -> tuple[TendonActuatedPCS, int]:
+def create_robot() -> tuple[PCS, int]:
     """
     Create a one-segment Tendon-Actuated PCS robot with 3 tendons.
 
@@ -51,54 +69,52 @@ def create_robot() -> tuple[TendonActuatedPCS, int]:
         - All attached to the end of the single segment
 
     Returns:
-        robot: The TendonActuatedPCS instance.
+        robot: The PCS instance with threadlike tendon actuation.
         num_dofs: Number of degrees of freedom.
     """
     num_segments = 1
     radius = 2e-2  # Segment radius [m]
     rho = 1070 * jnp.ones((num_segments,))  # Volumetric density [kg/m^3]
 
-    params = {
-        # Base pose: robot pointing upward in z-direction
-        "p0": jnp.array([jnp.pi / 2, jnp.pi / 2, 0.0, 0.0, 0.0, 0.0]),
-        "L": 1e-1 * jnp.ones((num_segments,)),  # Segment length [m]
-        "r": radius * jnp.ones((num_segments,)),  # Segment radius [m]
-        "rho": rho,
-        "g": jnp.array([0.0, 0.0, 9.81]),  # Gravity vector [m/s^2]
-        "E": 2e3 * jnp.ones((num_segments,)),  # Elastic modulus [Pa]
-        "G": 1e3 * jnp.ones((num_segments,)),  # Shear modulus [Pa]
-    }
-    # Damping matrix
-    params["D"] = 1e-3 * jnp.diag(
-        (
-            jnp.repeat(
-                jnp.array([[1e0, 1e0, 1e0, 1e3, 1e3, 1e3]]), num_segments, axis=0
+    segment_lengths = 1e-1 * jnp.ones((num_segments,))
+    material_damping_coefficient = 362.0
+    body_params = PCS.params_from_links(
+        [
+            LinkSpec.circular(
+                length=float(segment_lengths[index]),
+                radius=radius,
+                density=float(rho[index]),
+                young_modulus=2e3,
+                shear_modulus=1e3,
+                material_damping_coefficient=material_damping_coefficient,
+                reference_strain=[0, 0, 0, 1, 0, 0],
             )
-            * params["L"][:, None]
-        ).flatten()
+            for index in range(num_segments)
+        ],
+        gravity=jnp.array([0.0, 0.0, -9.81]),
     )
 
     # Tendon routing: 3 tendons at 120 degrees apart, parallel to backbone
     # Tendon positions at angles: 0°, 120°, 240° from the +z axis
     # d_y = r * sin(theta), d_z = r * cos(theta)
-    tendon_distance = 0.8 * radius  # Slightly inside the robot radius
+    tendon_offset_radius = 0.8 * radius  # Slightly inside the robot radius
     angles_deg = jnp.array([0.0, 120.0, 240.0])
     angles_rad = jnp.deg2rad(angles_deg)
 
-    active_tendon_routing_params = {
-        "ry": tendon_distance * jnp.sin(angles_rad),  # y-coordinate of tendons
-        "rz": tendon_distance * jnp.cos(angles_rad),  # z-coordinate of tendons
-        "my": jnp.zeros(3),  # Parallel to backbone (no y-slope)
-        "mz": jnp.zeros(3),  # Parallel to backbone (no z-slope)
-        "idx_seg_att": jnp.array(
-            [0, 0, 0]
-        ),  # All attached to segment 0 (the only segment)
-    }
+    active_tendon_routing = ThreadlikeRouting.linear(
+        intercept=tendon_offset_radius
+        * jnp.stack(
+            (jnp.zeros_like(angles_rad), jnp.sin(angles_rad), jnp.cos(angles_rad)),
+            axis=-1,
+        ),
+        start_segment_index=0,
+        end_segment_index=(0, 0, 0),
+    )
 
-    robot = TendonActuatedPCS(
-        num_segments=num_segments,
-        params=params,
-        active_tendon_routing_params=active_tendon_routing_params,
+    robot = PCS(
+        params=body_params,
+        base_pose=poses.spatial_mounting_pose("hanging"),
+        actuators=ThreadlikeActuator.tendons(active_tendon_routing),
     )
 
     num_dofs = robot.num_active_strains
@@ -107,7 +123,7 @@ def create_robot() -> tuple[TendonActuatedPCS, int]:
 
 
 def find_steady_state_configuration(
-    robot: TendonActuatedPCS,
+    robot: PCS,
     u_constant: jnp.ndarray,
     sim_duration: float = 10.0,
     solver_dt: float = 1e-4,
@@ -119,7 +135,7 @@ def find_steady_state_configuration(
     become negligible, indicating steady-state has been reached.
 
     Args:
-        robot: The TendonActuatedPCS robot.
+        robot: The PCS robot with threadlike tendon actuation.
         u_constant: Constant tendon tensions to apply.
         sim_duration: Duration of the simulation.
         solver_dt: Time step for the solver.
@@ -215,7 +231,7 @@ def create_setpoint_trajectory(
 
 
 def run_simulation(
-    robot: TendonActuatedPCS,
+    robot: PCS,
     controller,
     num_actuators: int,
     t0: float,
@@ -289,7 +305,12 @@ def compute_metrics(results: dict, q_des: jnp.ndarray, strain_indices: list) -> 
     }
 
 
-def main():
+def main(
+    *,
+    show: bool = True,
+    render: bool = True,
+    figures_dir: Path = FIGURES_DIR,
+):
     # =========================================================================
     # Setup
     # =========================================================================
@@ -307,9 +328,9 @@ def main():
     # =========================================================================
     print("\nFinding steady-state configuration under constant actuation...")
 
-    # Apply constant tendon tensions (negative = pulling)
+    # Apply positive tendon tensions.
     # Use asymmetric tensions to create an interesting configuration
-    u_constant = jnp.array([-0.05, -0.02, -0.01])
+    u_constant = jnp.array([0.05, 0.02, 0.01])
     print(f"  Applied tendon tensions: {u_constant}")
 
     q_des = find_steady_state_configuration(robot, u_constant, sim_duration=10.0)
@@ -384,7 +405,7 @@ def main():
     print(header)
     print("-" * 70)
 
-    for name, results in all_results.items():
+    for name, _results in all_results.items():
         metrics = compute_metrics(results, q_des, strain_indices)
         all_results[name]["metrics"] = metrics
         rmse = metrics["rmse"]
@@ -402,7 +423,7 @@ def main():
     print(header)
     print("-" * 70)
 
-    for name, results in all_results.items():
+    for name in all_results:
         ss_error = all_results[name]["metrics"]["ss_error"]
         row = f"{name:<25}"
         for val in ss_error:
@@ -437,7 +458,7 @@ def main():
         ax = axes[idx]
 
         # Plot desired setpoint
-        t = all_results["PID (model-free)"]["t"]
+        all_results["PID (model-free)"]["t"]
         ax.axhline(
             y=q_des[strain_idx],
             color="k",
@@ -467,8 +488,16 @@ def main():
     axes[0].set_title("Actuation-Space Setpoint Regulation: Strain Tracking Comparison")
 
     plt.tight_layout()
-    plt.savefig("actuation_space_regulation_tracking.pdf", dpi=200, bbox_inches="tight")
-    plt.show()
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    plt.savefig(
+        figures_dir / "setpoint_regulation_comparison_tracking.pdf",
+        dpi=200,
+        bbox_inches="tight",
+    )
+    if show:
+        plt.show()
+    else:
+        plt.close()
 
     # Create figure for tracking errors
     fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
@@ -499,8 +528,15 @@ def main():
     axes[0].set_title("Actuation-Space Setpoint Regulation: Tracking Error Comparison")
 
     plt.tight_layout()
-    plt.savefig("actuation_space_regulation_errors.pdf", dpi=200, bbox_inches="tight")
-    plt.show()
+    plt.savefig(
+        figures_dir / "setpoint_regulation_comparison_errors.pdf",
+        dpi=200,
+        bbox_inches="tight",
+    )
+    if show:
+        plt.show()
+    else:
+        plt.close()
 
     # Create figure for control inputs (tendon tensions)
     fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
@@ -540,8 +576,15 @@ def main():
     )
 
     plt.tight_layout()
-    plt.savefig("actuation_space_regulation_inputs.pdf", dpi=200, bbox_inches="tight")
-    plt.show()
+    plt.savefig(
+        figures_dir / "setpoint_regulation_comparison_inputs.pdf",
+        dpi=200,
+        bbox_inches="tight",
+    )
+    if show:
+        plt.show()
+    else:
+        plt.close()
 
     # Create bar chart for RMSE comparison
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -557,7 +600,7 @@ def main():
             all_results[name]["metrics"]["rmse"][strain_idx]
             for name in controller_names
         ]
-        bars = ax.bar(x + i * width, rmse_values, width, label=strain_name)
+        ax.bar(x + i * width, rmse_values, width, label=strain_name)
 
     ax.set_xlabel("Controller")
     ax.set_ylabel("RMSE")
@@ -568,30 +611,60 @@ def main():
     ax.grid(True, alpha=0.3, axis="y")
 
     plt.tight_layout()
-    plt.savefig("actuation_space_regulation_rmse.pdf", dpi=200, bbox_inches="tight")
-    plt.show()
+    plt.savefig(
+        figures_dir / "setpoint_regulation_comparison_rmse.pdf",
+        dpi=200,
+        bbox_inches="tight",
+    )
+    if show:
+        plt.show()
+    else:
+        plt.close()
 
     print("\nPlots saved to:")
-    print("  - actuation_space_regulation_tracking.pdf")
-    print("  - actuation_space_regulation_errors.pdf")
-    print("  - actuation_space_regulation_inputs.pdf")
-    print("  - actuation_space_regulation_rmse.pdf")
+    print("  - figures/setpoint_regulation_comparison_tracking.pdf")
+    print("  - figures/setpoint_regulation_comparison_errors.pdf")
+    print("  - figures/setpoint_regulation_comparison_inputs.pdf")
+    print("  - figures/setpoint_regulation_comparison_rmse.pdf")
 
+    if not render:
+        return
     if Open3DRenderer is None:
-        print("Open3DRenderer unavailable. Install open3d to view the animation.")
+        print("Open3DRenderer unavailable. Install open3d to export the video.")
     else:
         render_name = "PID (model-free)"
         if render_name not in all_results:
             render_name = next(iter(all_results.keys()))
         render_results = all_results[render_name]
-        renderer = Open3DRenderer(robot, num_points=50)
+        renderer = Open3DRenderer(
+            robot,
+            config=RendererConfig(
+                geometry=GeometryConfig(num_points=50),
+                scene=SceneConfig.technical(
+                    ground=GroundPlaneConfig(
+                        surface=False, height_reference="base_mounting_face"
+                    )
+                ),
+            ),
+        )
         renderer.render_sequence(
             ts=render_results["t"],
             q_ts=render_results["q"],
             playback_speed=1.0,
+            record_path=str(VIDEO_OUTPUT),
             window_name=f"Actuation-Space Regulation ({render_name})",
         )
+        print(f"Saved {VIDEO_OUTPUT}")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--no-show", action="store_true")
+    parser.add_argument("--no-render", action="store_true")
+    parser.add_argument("--figures-dir", type=Path, default=FIGURES_DIR)
+    args = parser.parse_args()
+    main(
+        show=not args.no_show,
+        render=not args.no_render,
+        figures_dir=args.figures_dir,
+    )

@@ -12,12 +12,23 @@ References:
     2508-2515.
 """
 
+import argparse
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 
+from soromox.rendering.config import (
+    GeometryConfig,
+    GroundPlaneConfig,
+    RendererConfig,
+    SceneConfig,
+)
+
 jax.config.update("jax_enable_x64", True)  # Double precision
 
+from soromox.actuation import ThreadlikeActuator, ThreadlikeRouting
 from soromox.control import (
     OperationalSpaceSynergisticController,
     PIDControl,
@@ -26,61 +37,75 @@ from soromox.control import (
 )
 from soromox.coordinate_transformations import OperationalSpaceDynamics
 from soromox.rendering import Open3DRenderer
-from soromox.systems import SystemState, TendonActuatedPCS
+from soromox.systems import (
+    PCS,
+    LinkSpec,
+    SystemState,
+)
+from soromox.utils.geometry import poses
+
+FIGURES_DIR = Path(__file__).resolve().parent / "figures"
+VIDEO_OUTPUT = Path(__file__).resolve().parent / "videos" / f"{Path(__file__).stem}.mp4"
 
 
-def main():
+def main(
+    *,
+    show: bool = True,
+    render: bool = True,
+    figures_dir: Path = FIGURES_DIR,
+):
     # =========================================================================
     # Robot Configuration: Two-Segment tendon-actuated PCS
     # =========================================================================
     num_segments = 2
     rho = 1070 * jnp.ones((num_segments,))  # Volumetric density [kg/m^3]
 
-    # Define the initial base pose (identity for simplicity - rod points along x-axis)
-    # p0 defines the base orientation in Euler angles convention
-    p0 = jnp.array([jnp.pi / 2, jnp.pi / 2, 0.0, 0.0, 0.0, 0.0])
+    base_pose = poses.spatial_mounting_pose("hanging")
 
-    params = {
-        "p0": p0,
-        "L": 1e-1 * jnp.ones((num_segments,)),  # Segment length [m]
-        "r": 2e-2 * jnp.ones((num_segments,)),  # Segment radius [m]
-        "rho": rho,
-        "g": jnp.array([0.0, 0.0, 9.81]),  # Gravity vector [m/s^2]
-        "E": 2e3 * jnp.ones((num_segments,)),  # Elastic modulus [Pa]
-        "G": 1e3 * jnp.ones((num_segments,)),  # Shear modulus [Pa]
-    }
-
-    # Damping matrix
-    params["D"] = 1e-3 * jnp.diag(
-        (
-            jnp.repeat(
-                jnp.array([[1e0, 1e0, 1e0, 1e3, 1e3, 1e3]]), num_segments, axis=0
+    segment_lengths = 1e-1 * jnp.ones((num_segments,))
+    material_damping_coefficient = 362.0
+    body_params = PCS.params_from_links(
+        [
+            LinkSpec.circular(
+                length=float(segment_lengths[index]),
+                radius=2e-2,
+                density=float(rho[index]),
+                young_modulus=2e3,
+                shear_modulus=1e3,
+                material_damping_coefficient=material_damping_coefficient,
+                reference_strain=[0, 0, 0, 1, 0, 0],
             )
-            * params["L"][:, None]
-        ).flatten()
+            for index in range(num_segments)
+        ],
+        gravity=jnp.array([0.0, 0.0, -9.81]),
     )
 
     # Tendons
     theta = jnp.pi / 32
     dtheta = jnp.pi / 3
-    active_tendon_routing_params = {
-        "ry": 1.8e-2
-        * jnp.cos(jnp.array([theta, theta + 2 * dtheta, theta + 4 * dtheta])),
-        "rz": 1.8e-2
-        * jnp.sin(jnp.array([theta, theta + 2 * dtheta, theta + 4 * dtheta])),
-        "my": jnp.array([0.0, 0.0, 0.0]),
-        "mz": jnp.array([0.0, 0.0, 0.0]),
-        "idx_seg_att": jnp.array([1, 1, 1]),
-    }
+    tendon_angles = jnp.array([theta, theta + 2 * dtheta, theta + 4 * dtheta])
+    active_tendon_routing = ThreadlikeRouting.linear(
+        intercept=1.8e-2
+        * jnp.stack(
+            (
+                jnp.zeros_like(tendon_angles),
+                jnp.cos(tendon_angles),
+                jnp.sin(tendon_angles),
+            ),
+            axis=-1,
+        ),
+        start_segment_index=0,
+        end_segment_index=(1, 1, 1),
+    )
 
     # Initialize robot
-    robot = TendonActuatedPCS(
-        num_segments=num_segments,
-        params=params,
-        active_tendon_routing_params=active_tendon_routing_params,
+    robot = PCS(
+        params=body_params,
+        base_pose=base_pose,
+        actuators=ThreadlikeActuator.tendons(active_tendon_routing),
     )
     num_dofs = robot.num_active_strains
-    total_length = float(jnp.sum(params["L"]))
+    total_length = float(jnp.sum(segment_lengths))
 
     print(f"Number of DOFs: {num_dofs}")
     print(f"Number of actuators: {robot.num_actuators}")
@@ -131,7 +156,7 @@ def main():
     def x_des_fn(t):
         """Desired FULL end-effector pose as a function of time."""
         # Start from rest position and move in y-z plane
-        # The robot initially points along the x-axis (after the base rotation)
+        # The robot initially hangs along the world -z axis.
         period = 4.0
         amplitude_y = 0.02  # 2 cm amplitude in y
         amplitude_z = 0.01  # 1 cm amplitude in z
@@ -297,8 +322,15 @@ def main():
     ax3.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig("control_pcs_with_impedance_results.pdf", dpi=200)
-    plt.show()
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    plt.savefig(
+        figures_dir / "control_tendon_actuated_pcs_with_synergistic_results.pdf",
+        dpi=200,
+    )
+    if show:
+        plt.show()
+    else:
+        plt.close()
 
     # Plot configuration space evolution
     fig2, axes2 = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
@@ -328,8 +360,14 @@ def main():
     ax2.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig("control_pcs_with_impedance_config.pdf", dpi=200)
-    plt.show()
+    plt.savefig(
+        figures_dir / "control_tendon_actuated_pcs_with_synergistic_config.pdf",
+        dpi=200,
+    )
+    if show:
+        plt.show()
+    else:
+        plt.close()
 
     # Compute and print summary statistics
     rmse = jnp.sqrt(jnp.mean(tracking_error**2, axis=0))
@@ -337,25 +375,48 @@ def main():
     print(f"Mean RMSE: {jnp.mean(rmse) * 1000:.3f} mm")
 
     print("\nPlots saved to:")
-    print("  - control_pcs_with_impedance_results.pdf")
-    print("  - control_pcs_with_impedance_config.pdf")
+    print("  - figures/control_tendon_actuated_pcs_with_synergistic_results.pdf")
+    print("  - figures/control_tendon_actuated_pcs_with_synergistic_config.pdf")
 
+    if not render:
+        return
     if Open3DRenderer is None:
-        print("\nOpen3DRenderer unavailable. Install open3d to view the animation.")
+        print("\nOpen3DRenderer unavailable. Install open3d to export the video.")
     else:
-        target_radius = float(jnp.mean(params["r"])) * 0.5
+        target_radius = float(jnp.mean(robot.params.r)) * 0.5
         target_positions = jnp.asarray(x_des_traj_pos)[None, :, :]
-        renderer = Open3DRenderer(robot, num_points=50)
+        renderer = Open3DRenderer(
+            robot,
+            config=RendererConfig(
+                geometry=GeometryConfig(num_points=50),
+                scene=SceneConfig.technical(
+                    ground=GroundPlaneConfig(
+                        surface=False, height_reference="base_mounting_face"
+                    )
+                ),
+            ),
+        )
         renderer.render_sequence(
             ts=t_traj,
             q_ts=q_traj,
             playback_speed=1.0,
+            record_path=str(VIDEO_OUTPUT),
             dynamic_spheres_positions=target_positions,
             dynamic_spheres_radii=jnp.array([target_radius]),
             dynamics_spheres_colors=jnp.array([[0.1, 0.6, 0.9]]),
             window_name="Operational-Space Tracking (Open3D)",
-        )  # '''
+        )
+        print(f"Saved {VIDEO_OUTPUT}")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--no-show", action="store_true")
+    parser.add_argument("--no-render", action="store_true")
+    parser.add_argument("--figures-dir", type=Path, default=FIGURES_DIR)
+    args = parser.parse_args()
+    main(
+        show=not args.no_show,
+        render=not args.no_render,
+        figures_dir=args.figures_dir,
+    )

@@ -2,6 +2,7 @@
 import jax
 
 jax.config.update("jax_enable_x64", True)
+import equinox as eqx
 import jax.numpy as jnp
 import numpy as onp
 import pytest
@@ -10,6 +11,12 @@ from numpy.testing import assert_allclose
 
 from soromox.systems import ArticulatedSoftRobot, Pendulum, SoftRobot
 from soromox.utils.tolerance import Tolerance
+from system_param_builders import (
+    articulated_params,
+    pendulum_params,
+    planar_base_pose,
+    spatial_base_pose,
+)
 
 
 def make_articulated_robot(num_links: int = 2) -> ArticulatedSoftRobot:
@@ -26,28 +33,108 @@ def make_articulated_robot(num_links: int = 2) -> ArticulatedSoftRobot:
             for i in range(num_links)
         ]
     )
-    params = {
-        "joint_screws": joint_screws,
-        "p_tip": p_tip,
-        "p_com": p_com,
-        "m": m,
-        "I_com": I_com,
-        "g": jnp.array([0.0, -9.81, 0.0]),
-    }
-    return ArticulatedSoftRobot(params)
+    params = articulated_params(
+        joint_screw=joint_screws,
+        tip_position=p_tip,
+        center_of_mass_position=p_com,
+        mass=m,
+        center_of_mass_inertia=I_com,
+        gravity=jnp.array([0.0, -9.81, 0.0]),
+    )
+    return ArticulatedSoftRobot(params, base_pose=spatial_base_pose())
+
+
+def _updated_articulated_params(params):
+    return params.replace(
+        gravity=params.gravity.at[2].set(-9.7),
+        mass=params.mass + 0.1,
+        center_of_mass_inertia=1.02 * params.center_of_mass_inertia,
+        joint_stiffness=params.joint_stiffness + 0.2 * jnp.eye(params.mass.shape[0]),
+    )
+
+
+def _articulated_parameter_summary(robot):
+    return jnp.concatenate(
+        [
+            robot.fixed_base_pose,
+            robot.g,
+            robot.m,
+            robot.I_com.reshape(-1),
+            robot.K.reshape(-1),
+        ]
+    )
+
+
+def test_parameter_updates_refresh_eager_runtime_arrays_immutably():
+    robot = make_articulated_robot()
+    updated_params = _updated_articulated_params(robot.params)
+    before = _articulated_parameter_summary(robot)
+
+    updated = robot.with_params(updated_params)
+
+    assert_allclose(_articulated_parameter_summary(robot), before)
+    assert not jnp.allclose(_articulated_parameter_summary(updated), before)
+
+
+def test_same_structure_parameter_updates_compile_once():
+    robot = make_articulated_robot()
+    updated_params = _updated_articulated_params(robot.params)
+    trace_count = {"value": 0}
+
+    @eqx.filter_jit
+    def compiled_summary(current_params):
+        trace_count["value"] += 1
+        return _articulated_parameter_summary(robot.with_params(current_params))
+
+    baseline = compiled_summary(robot.params)
+    actual = compiled_summary(updated_params)
+
+    assert trace_count["value"] == 1
+    assert not jnp.allclose(actual, baseline)
+    assert_allclose(
+        actual, _articulated_parameter_summary(robot.with_params(updated_params))
+    )
+
+
+def test_parameter_gradient_passes_through_compiled_update():
+    robot = make_articulated_robot()
+
+    @eqx.filter_jit
+    def scalar_summary(current_params):
+        return jnp.sum(
+            _articulated_parameter_summary(robot.with_params(current_params))
+        )
+
+    gradient = eqx.filter_grad(scalar_summary)(robot.params)
+
+    assert gradient.mass.shape == robot.params.mass.shape
+    assert jnp.all(jnp.isfinite(gradient.mass))
+    assert jnp.any(gradient.mass != 0.0)
+
+
+def test_parameter_structure_changes_require_reconstruction():
+    robot = make_articulated_robot()
+    wrong_shape = eqx.tree_at(
+        lambda params: params.mass,
+        robot.params,
+        jnp.ones((3,), dtype=jnp.float64),
+    )
+
+    with pytest.raises(ValueError, match="shape|structure|construct"):
+        robot.with_params(wrong_shape)
 
 
 def make_matching_pendulum(num_links: int = 2) -> Pendulum:
     assert num_links in (2, 3)
     L = jnp.array([1.0, 1.5, 0.8])[:num_links]
-    params = {
-        "m": jnp.array([1.0, 2.0, 0.8])[:num_links],
-        "I": jnp.array([0.1, 0.2, 0.05])[:num_links],
-        "L": L,
-        "Lc": 0.5 * L,
-        "g": jnp.array([0.0, -9.81]),
-    }
-    return Pendulum(params)
+    params = pendulum_params(
+        mass=jnp.array([1.0, 2.0, 0.8])[:num_links],
+        moment_inertia=jnp.array([0.1, 0.2, 0.05])[:num_links],
+        length=L,
+        center_of_mass_length=0.5 * L,
+        gravity=jnp.array([0.0, -9.81]),
+    )
+    return Pendulum(params, base_pose=planar_base_pose())
 
 
 def make_spatial_robot() -> ArticulatedSoftRobot:
@@ -58,23 +145,25 @@ def make_spatial_robot() -> ArticulatedSoftRobot:
             [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         ]
     )
-    params = {
-        "joint_screws": joint_screws,
-        "p_tip": jnp.array([[0.8, 0.0, 0.1], [0.6, 0.0, 0.2], [0.4, 0.1, 0.0]]),
-        "p_com": jnp.array([[0.4, 0.0, 0.05], [0.3, 0.0, 0.1], [0.2, 0.05, 0.0]]),
-        "m": jnp.array([1.0, 0.8, 0.5]),
-        "I_com": jnp.array(
+    params = articulated_params(
+        joint_screw=joint_screws,
+        tip_position=jnp.array([[0.8, 0.0, 0.1], [0.6, 0.0, 0.2], [0.4, 0.1, 0.0]]),
+        center_of_mass_position=jnp.array(
+            [[0.4, 0.0, 0.05], [0.3, 0.0, 0.1], [0.2, 0.05, 0.0]]
+        ),
+        mass=jnp.array([1.0, 0.8, 0.5]),
+        center_of_mass_inertia=jnp.array(
             [
                 jnp.diag(jnp.array([0.02, 0.03, 0.04])),
                 jnp.diag(jnp.array([0.015, 0.025, 0.035])),
                 jnp.diag(jnp.array([0.01, 0.02, 0.03])),
             ]
         ),
-        "g": jnp.array([0.0, 0.0, -9.81]),
-        "K": jnp.diag(jnp.array([0.2, 0.3, 0.4])),
-        "D": jnp.diag(jnp.array([0.01, 0.02, 0.03])),
-    }
-    return ArticulatedSoftRobot(params)
+        gravity=jnp.array([0.0, 0.0, -9.81]),
+        joint_stiffness=jnp.diag(jnp.array([0.2, 0.3, 0.4])),
+        joint_damping=jnp.diag(jnp.array([0.01, 0.02, 0.03])),
+    )
+    return ArticulatedSoftRobot(params, base_pose=spatial_base_pose())
 
 
 def assert_finite(value, name: str) -> None:
@@ -85,28 +174,45 @@ def test_import_and_inheritance():
     robot = make_articulated_robot()
 
     assert isinstance(robot, SoftRobot)
-    assert robot.num_dofs == 2
+    assert robot.num_internal_dofs == 2
     assert robot.num_actuators == 2
     assert not robot.is_planar
 
 
 def test_constructor_shape_validation():
-    params = {
-        "joint_screws": jnp.zeros((2, 6)),
-        "p_tip": jnp.zeros((2, 3)),
-        "p_com": jnp.zeros((2, 3)),
-        "m": jnp.ones((2,)),
-        "I_com": jnp.broadcast_to(jnp.eye(3), (2, 3, 3)),
-        "g": jnp.zeros((3,)),
-    }
+    params = articulated_params(
+        joint_screw=jnp.zeros((2, 6)),
+        tip_position=jnp.zeros((2, 3)),
+        center_of_mass_position=jnp.zeros((2, 3)),
+        mass=jnp.ones((2,)),
+        center_of_mass_inertia=jnp.broadcast_to(jnp.eye(3), (2, 3, 3)),
+        gravity=jnp.zeros((3,)),
+    )
 
-    with pytest.raises(ValueError, match="p_tip"):
-        ArticulatedSoftRobot({**params, "p_tip": jnp.zeros((3, 3))})
+    with pytest.raises(ValueError, match="tip_position"):
+        ArticulatedSoftRobot(params.replace(tip_position=jnp.zeros((3, 3))))
 
-    with pytest.raises(ValueError, match="I_com"):
+    with pytest.raises(ValueError, match="center_of_mass_inertia"):
         ArticulatedSoftRobot(
-            {**params, "I_com": jnp.broadcast_to(jnp.eye(3), (3, 3, 3))}
+            params.replace(
+                center_of_mass_inertia=jnp.broadcast_to(jnp.eye(3), (3, 3, 3))
+            )
         )
+
+
+def test_segment_length_gradient_is_finite_for_zero_tip_vector():
+    """A zero-length link must use the defined zero derivative of ``safe_norm``."""
+    robot = make_articulated_robot()
+    p_tip = jnp.zeros_like(robot.p_tip)
+
+    gradient = jax.grad(
+        lambda tips: jnp.sum(
+            ArticulatedSoftRobot(robot.params.replace(tip_position=tips)).segment_length
+        )
+    )(p_tip)
+
+    assert jnp.isfinite(gradient).all()
+    assert_allclose(gradient, jnp.zeros_like(p_tip))
 
 
 @pytest.mark.parametrize("num_links", [2, 3])
@@ -130,17 +236,45 @@ def test_tip_linear_jacobian_match_autodiff(num_links):
 
 
 @pytest.mark.parametrize("num_links", [2, 3])
-def test_jacobian_derivative_matches_jvp(num_links):
+def test_jacobian_time_derivative_matches_jvp(num_links):
     robot = make_articulated_robot(num_links)
     q = jnp.linspace(-0.3, 0.4, num_links)
     qd = jnp.linspace(0.6, -0.5, num_links)
 
-    J, Jd = robot.jacobian_and_derivatives_tips(q, qd)
+    J, Jd = robot.jacobian_and_time_derivatives_tips(q, qd)
     J_direct = robot.jacobian_tips(q)
     _, Jd_jvp = jax.jvp(robot.jacobian_tips, (q,), (qd,))
 
     assert_allclose(J, J_direct, rtol=Tolerance.rtol(), atol=Tolerance.atol())
     assert_allclose(Jd, Jd_jvp, rtol=Tolerance.rtol(), atol=Tolerance.atol())
+
+
+def test_spatial_jacobian_time_derivative_matches_jvp():
+    robot = make_spatial_robot()
+    q = jnp.array([0.2, -0.3, 0.4])
+    qd = jnp.array([0.5, -0.2, 0.3])
+
+    J_tips, Jd_tips = robot.jacobian_and_time_derivatives_tips(q, qd)
+    J_tips_direct = robot.jacobian_tips(q)
+    _, Jd_tips_jvp = jax.jvp(robot.jacobian_tips, (q,), (qd,))
+
+    assert_allclose(J_tips, J_tips_direct, rtol=Tolerance.rtol(), atol=Tolerance.atol())
+    assert_allclose(Jd_tips, Jd_tips_jvp, rtol=Tolerance.rtol(), atol=Tolerance.atol())
+
+    s_points = jnp.stack(
+        [
+            jnp.array(0.2, dtype=q.dtype),
+            robot.L_cum[1] + jnp.array(0.2, dtype=q.dtype),
+            robot.total_length - jnp.array(0.05, dtype=q.dtype),
+        ]
+    )
+    for s in s_points:
+        J, Jd = robot._jacobian_and_time_derivative(q, qd, s)
+        J_direct = robot._jacobian(q, s)
+        _, Jd_jvp = jax.jvp(lambda q_, s=s: robot._jacobian(q_, s), (q,), (qd,))
+
+        assert_allclose(J, J_direct, rtol=Tolerance.rtol(), atol=Tolerance.atol())
+        assert_allclose(Jd, Jd_jvp, rtol=Tolerance.rtol(), atol=Tolerance.atol())
 
 
 @pytest.mark.parametrize("num_links", [2, 3])
@@ -235,6 +369,34 @@ def test_spatial_mixed_axis_chain_matches_dense_matrix_equation():
     assert_allclose(qdd, qdd_dense, rtol=Tolerance.rtol(), atol=Tolerance.atol())
 
 
+def test_rotated_fixed_base_forward_dynamics_matches_dense_matrix_equation():
+    robot = make_spatial_robot().with_fixed_base_pose(
+        jnp.array([0.0, 2**-0.5, 0.0, 2**-0.5, 0.2, -0.1, 0.7])
+    )
+    q = jnp.array([0.2, -0.3, 0.4])
+    qd = jnp.array([0.5, -0.2, 0.3])
+    u = jnp.array([0.1, -0.05, 0.2])
+    tau_ext = jnp.array([0.02, 0.01, -0.03])
+
+    y = jnp.concatenate([q, qd])
+    _, qdd = jnp.split(
+        robot.forward_dynamics(jnp.array(0.0), y, (u, tau_ext)),
+        2,
+    )
+    inertia, coriolis_velocity, gravity = robot.dynamics_terms(q, qd)
+    rhs = (
+        robot.actuation_force(q, u)
+        + tau_ext
+        - coriolis_velocity
+        - gravity
+        - robot.elastic_force(q)
+        - robot.damping_matrix(q) @ qd
+    )
+    qdd_dense = jnp.linalg.solve(inertia, rhs)
+
+    assert_allclose(qdd, qdd_dense, rtol=Tolerance.rtol(), atol=Tolerance.atol())
+
+
 @pytest.mark.parametrize("num_links", [2, 3])
 def test_batched_kinematics_and_jacobian_match_pointwise_evaluation(num_links):
     robot = make_articulated_robot(num_links)
@@ -242,16 +404,18 @@ def test_batched_kinematics_and_jacobian_match_pointwise_evaluation(num_links):
     qd = jnp.linspace(0.6, -0.5, num_links)
     s_ps = robot.L_cum[1:]
 
-    g_batched = robot.forward_kinematics_batched(q, s_ps)
+    g_batched = robot.forward_kinematics_abscissa_batched(q, s_ps)
     g_expected = jax.vmap(lambda s: robot.forward_kinematics(q, s))(s_ps)
     assert_allclose(g_batched, g_expected, rtol=Tolerance.rtol(), atol=Tolerance.atol())
 
-    J_batched = robot.jacobian_batched(q, s_ps)
+    J_batched = robot.jacobian_abscissa_batched(q, s_ps)
     J_expected = robot.jacobian_tips(q)
     assert_allclose(J_batched, J_expected, rtol=Tolerance.rtol(), atol=Tolerance.atol())
 
-    J_batched, Jd_batched = robot.jacobian_and_derivative_batched(q, qd, s_ps)
-    J_expected, Jd_expected = robot.jacobian_and_derivatives_tips(q, qd)
+    J_batched, Jd_batched = robot.jacobian_and_time_derivative_abscissa_batched(
+        q, qd, s_ps
+    )
+    J_expected, Jd_expected = robot.jacobian_and_time_derivatives_tips(q, qd)
     assert_allclose(J_batched, J_expected, rtol=Tolerance.rtol(), atol=Tolerance.atol())
     assert_allclose(
         Jd_batched, Jd_expected, rtol=Tolerance.rtol(), atol=Tolerance.atol()
@@ -261,15 +425,15 @@ def test_batched_kinematics_and_jacobian_match_pointwise_evaluation(num_links):
 @pytest.mark.parametrize("num_links", [2, 3])
 def test_forward_mode_automatic_differentiability_at_zero_configuration(num_links):
     robot = make_articulated_robot(num_links)
-    q = jnp.zeros((robot.num_dofs,), dtype=jnp.float64)
-    qd = jnp.zeros((robot.num_dofs,), dtype=jnp.float64)
+    q = jnp.zeros((robot.num_internal_dofs,), dtype=jnp.float64)
+    qd = jnp.zeros((robot.num_internal_dofs,), dtype=jnp.float64)
     u = jnp.zeros((robot.num_actuators,), dtype=jnp.float64)
     y = jnp.concatenate([q, qd])
     s = robot.total_length
 
     dg_dq = jax.jacfwd(robot.forward_kinematics, argnums=0)(q, s)
     dJ_dq = jax.jacfwd(robot.jacobian, argnums=0)(q, s)
-    _, dJd_dq = jax.jacfwd(robot.jacobian_and_derivative, argnums=0)(q, qd, s)
+    _, dJd_dq = jax.jacfwd(robot.jacobian_and_time_derivative, argnums=0)(q, qd, s)
 
     assert_finite(dg_dq, "dg/dq")
     assert_finite(dJ_dq, "dJ/dq")
@@ -312,15 +476,15 @@ def test_forward_mode_automatic_differentiability_at_zero_configuration(num_link
 
 def test_reverse_mode_automatic_differentiability_at_zero_configuration():
     robot = make_spatial_robot()
-    q = jnp.zeros((robot.num_dofs,), dtype=jnp.float64)
-    qd = jnp.zeros((robot.num_dofs,), dtype=jnp.float64)
+    q = jnp.zeros((robot.num_internal_dofs,), dtype=jnp.float64)
+    qd = jnp.zeros((robot.num_internal_dofs,), dtype=jnp.float64)
     u = jnp.zeros((robot.num_actuators,), dtype=jnp.float64)
     y = jnp.concatenate([q, qd])
     s = robot.total_length
 
     dg_dq = jax.jacrev(robot.forward_kinematics, argnums=0)(q, s)
     dJ_dq = jax.jacrev(robot.jacobian, argnums=0)(q, s)
-    _, dJd_dq = jax.jacrev(robot.jacobian_and_derivative, argnums=0)(q, qd, s)
+    _, dJd_dq = jax.jacrev(robot.jacobian_and_time_derivative, argnums=0)(q, qd, s)
 
     assert_finite(dg_dq, "dg/dq")
     assert_finite(dJ_dq, "dJ/dq")

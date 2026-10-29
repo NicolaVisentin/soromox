@@ -3,36 +3,111 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
+import subprocess
+import sys
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import jax
 import jax.numpy as jnp
 
+from soromox.execution import ExecutionBackend
 from soromox.systems import (
     GVS,
     PCS,
     ArticulatedSoftRobot,
-    CrossSectionGeometry,
+    ArticulatedSoftRobotParams,
+    GVSSegment,
+    JointSpec,
+    LinkSpec,
+    PCSStructure,
     Pendulum,
+    PendulumParams,
     PlanarPCS,
+    PlanarPCSStructure,
+    StrainBasisSpec,
 )
-from soromox.systems.gvs import GVSSegment, JointSpec, LinkSpec, StrainBasisSpec
 
 Array = jax.Array
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _distribution_version(distribution: str) -> str | None:
+    """Return an installed distribution version without importing its package."""
+
+    try:
+        return importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _git_output(*args: str) -> str | None:
+    """Return one Git query result, or ``None`` outside a readable checkout."""
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(REPOSITORY_ROOT), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return result.stdout.strip()
+
+
+def benchmark_environment_metadata(device: jax.Device) -> dict[str, Any]:
+    """Describe the software and accelerator environment for an artifact row.
+
+    The returned fields are intentionally flat so they can be copied into both
+    JSON objects and CSV rows. Hostnames and user-specific paths are excluded;
+    the metadata captures the factors most likely to explain benchmark changes
+    without exposing machine identity.
+
+    Args:
+        device: JAX device on which the benchmark executes.
+
+    Returns:
+        Reproducibility metadata containing the UTC start time, source revision,
+        installed runtime versions, FP64 setting, and accelerator identity.
+    """
+
+    git_revision = _git_output("rev-parse", "HEAD")
+    tracked_changes = _git_output("status", "--porcelain", "--untracked-files=no")
+    device_kind = getattr(device, "device_kind", None)
+    platform_version = getattr(device.client, "platform_version", None)
+    return {
+        "timestamp_utc": datetime.now(UTC).isoformat(),
+        "git_revision": git_revision,
+        "git_dirty": None if tracked_changes is None else bool(tracked_changes),
+        "python_version": sys.version.split()[0],
+        "soromox_version": _distribution_version("soromox"),
+        "jax_version": jax.__version__,
+        "jaxlib_version": _distribution_version("jaxlib"),
+        "warp_version": _distribution_version("warp-lang"),
+        "x64_enabled": bool(jax.config.x64_enabled),
+        "device_kind": device_kind,
+        "device_id": f"{device.platform}:{device_kind or 'unknown'}:{device.id}",
+        "platform_version": platform_version,
+        "device_count": len(jax.devices(device.platform)),
+    }
 
 
 @dataclass(frozen=True)
 class SystemConfig:
     """Factory plus context builder for a Soromox system."""
 
-    factory: Callable[[int], Any]
+    factory: Callable[..., Any]
     size_label: str
     build_context: Callable[[Any], MutableMapping[str, Array]]
-    gauss_factory: Callable[[int, int], Any] | None = None
+    gauss_factory: Callable[..., Any] | None = None
     default_gauss_points: int | None = None
     min_gauss_points: int = 1
+    supports_backend: bool = False
 
     @property
     def supports_gauss_points(self) -> bool:
@@ -44,16 +119,18 @@ def _pendulum_factory(num_links: int) -> Pendulum:
     masses = jnp.linspace(0.8, 1.2, num_links)
     inertias = (1.0 / 12.0) * masses * lengths**2
     lc = lengths * 0.5
-    params = {
-        "m": masses,
-        "I": inertias,
-        "L": lengths,
-        "Lc": lc,
-        "g": jnp.array([0.0, -9.81]),
-        "K": 5.0 * jnp.eye(num_links),
-        "D": 0.1 * jnp.eye(num_links),
-    }
-    return Pendulum(params)
+    params = PendulumParams(
+        mass=masses,
+        moment_inertia=inertias,
+        length=lengths,
+        center_of_mass_length=lc,
+        gravity=jnp.array([0.0, -9.81]),
+        joint_stiffness=5.0 * jnp.eye(num_links),
+        joint_damping=0.1 * jnp.eye(num_links),
+        joint_rest_configuration=jnp.zeros((num_links,)),
+        radius=0.05 * lengths,
+    )
+    return Pendulum(params=params)
 
 
 def _pendulum_context(system: Pendulum) -> MutableMapping[str, Array]:
@@ -102,17 +179,20 @@ def _articulated_soft_robot_factory(
     )
     I_com = jax.vmap(jnp.diag)(I_diag)
 
-    params = {
-        "joint_screws": joint_screws,
-        "p_tip": p_tip,
-        "p_com": p_com,
-        "m": masses,
-        "I_com": I_com,
-        "g": jnp.array([0.0, 0.0, -9.81]),
-        "K": 5.0 * jnp.eye(num_links),
-        "D": 0.1 * jnp.eye(num_links),
-    }
-    return ArticulatedSoftRobot(params)
+    params = ArticulatedSoftRobotParams(
+        joint_screw=joint_screws,
+        parent_to_joint_transform=jnp.broadcast_to(jnp.eye(4), (num_links, 4, 4)),
+        tip_position=p_tip,
+        center_of_mass_position=p_com,
+        mass=masses,
+        center_of_mass_inertia=I_com,
+        gravity=jnp.array([0.0, 0.0, -9.81]),
+        joint_stiffness=5.0 * jnp.eye(num_links),
+        joint_damping=0.1 * jnp.eye(num_links),
+        joint_rest_configuration=jnp.zeros((num_links,)),
+        radius=0.05 * lengths,
+    )
+    return ArticulatedSoftRobot(params=params)
 
 
 def _articulated_soft_robot_context(
@@ -134,28 +214,29 @@ def _articulated_soft_robot_context(
     return ctx
 
 
-def _planar_pcs_factory(num_segments: int, gauss_points: int = 5) -> PlanarPCS:
-    lengths = jnp.full((num_segments,), 0.12)
-    radii = jnp.full((num_segments,), 0.015)
-    rho = 1070.0 * jnp.ones((num_segments,))
-    params: dict[str, Array] = {
-        "th0": jnp.array(jnp.pi / 2),
-        "L": lengths,
-        "r": radii,
-        "rho": rho,
-        "g": jnp.array([0.0, 9.81]),
-        "E": 4.0e5 * jnp.ones((num_segments,)),
-        "G": 1.5e5 * jnp.ones((num_segments,)),
-    }
-    diag_entries = (
-        jnp.repeat(jnp.array([[1.0, 200.0, 200.0]]), num_segments, axis=0)
-        * lengths[:, None]
-    ).reshape(-1)
-    params["D"] = 5.0e-4 * jnp.diag(diag_entries)
-    return PlanarPCS(
-        num_segments=num_segments,
-        params=params,
-        num_gauss_points=gauss_points,
+def _planar_pcs_factory(
+    num_segments: int,
+    gauss_points: int = 5,
+    *,
+    backend: ExecutionBackend = "auto",
+) -> PlanarPCS:
+    return PlanarPCS.from_links(
+        [
+            LinkSpec.circular(
+                length=0.12,
+                radius=0.015,
+                density=1070.0,
+                young_modulus=4.0e5,
+                shear_modulus=1.5e5,
+                material_damping_coefficient=5.0e-4,
+                reference_strain=[0.0, 1.0, 0.0],
+            )
+            for _ in range(num_segments)
+        ],
+        base_pose=jnp.array([jnp.pi / 2, 0.0, 0.0]),
+        gravity=jnp.array([0.0, 9.81]),
+        structure=PlanarPCSStructure(num_gauss_points=gauss_points),
+        backend=backend,
     )
 
 
@@ -182,30 +263,29 @@ def _planar_pcs_context(system: PlanarPCS) -> MutableMapping[str, Array]:
     return ctx
 
 
-def _pcs_factory(num_segments: int, gauss_points: int = 5) -> PCS:
-    lengths = jnp.full((num_segments,), 0.1)
-    radii = jnp.full((num_segments,), 0.02)
-    rho = 1050.0 * jnp.ones((num_segments,))
-    params: dict[str, Array] = {
-        "p0": jnp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        "L": lengths,
-        "r": radii,
-        "rho": rho,
-        "g": jnp.array([0.0, 0.0, -9.81]),
-        "E": 6.0e5 * jnp.ones((num_segments,)),
-        "G": 2.5e5 * jnp.ones((num_segments,)),
-    }
-    diag_entries = (
-        jnp.repeat(
-            jnp.array([[1.0, 1.0, 1.0, 300.0, 300.0, 300.0]]), num_segments, axis=0
-        )
-        * lengths[:, None]
-    ).reshape(-1)
-    params["D"] = 5.0e-4 * jnp.diag(diag_entries)
-    return PCS(
-        num_segments=num_segments,
-        params=params,
-        num_gauss_points=gauss_points,
+def _pcs_factory(
+    num_segments: int,
+    gauss_points: int = 5,
+    *,
+    backend: ExecutionBackend = "auto",
+) -> PCS:
+    return PCS.from_links(
+        [
+            LinkSpec.circular(
+                length=0.1,
+                radius=0.02,
+                density=1050.0,
+                young_modulus=6.0e5,
+                shear_modulus=2.5e5,
+                material_damping_coefficient=5.0e-4,
+                reference_strain=[0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            )
+            for _ in range(num_segments)
+        ],
+        base_pose=jnp.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+        gravity=jnp.array([0.0, 0.0, -9.81]),
+        structure=PCSStructure(num_gauss_points=gauss_points),
+        backend=backend,
     )
 
 
@@ -233,40 +313,81 @@ def _pcs_context(system: PCS) -> MutableMapping[str, Array]:
     return ctx
 
 
-def _gvs_factory(num_segments: int, gauss_points: int = 5) -> GVS:
+def _gvs_segment(strain_basis_order: int, gauss_points: int) -> GVSSegment:
+    if strain_basis_order < 0:
+        raise ValueError("GVS strain-basis order must be non-negative.")
+
+    return GVSSegment(
+        link=LinkSpec.circular(
+            young_modulus=1.0e6,
+            shear_modulus=1.0e6 / 2.9,
+            density=980.0,
+            material_damping_coefficient=2.5e3,
+            length=0.25,
+            radius=0.02,
+            reference_strain=[0, 0, 0, 1, 0, 0],
+        ),
+        joint=JointSpec(type="fixed"),
+        basis=StrainBasisSpec(
+            type="legendre",
+            strain_selector=[1, 1, 1, 1, 1, 1],
+            basis_order=int(strain_basis_order),
+        ),
+        num_gauss_points=gauss_points,
+    )
+
+
+def _gvs_factory(
+    num_segments: int,
+    gauss_points: int = 5,
+    *,
+    backend: ExecutionBackend = "auto",
+) -> GVS:
     segments: list[GVSSegment] = []
     for _ in range(num_segments):
-        segments.append(
-            GVSSegment(
-                link=LinkSpec(
-                    cross_section_geometry=CrossSectionGeometry.CIRCULAR,
-                    E=1.0e6,
-                    nu=0.45,
-                    rho=980.0,
-                    eta=2.5e3,
-                    L=0.25,
-                    r_i=0.02,
-                    r_f=0.02,
-                ),
-                joint=JointSpec(type="fixed"),
-                basis=StrainBasisSpec(
-                    type="monomial",
-                    active=[1, 1, 1, 1, 1, 1],
-                    orders=[1, 1, 1, 1, 1, 1],
-                    xi_ref=[0, 0, 0, 1, 0, 0],
-                ),
-                num_gauss_points=gauss_points,
-            )
-        )
+        segments.append(_gvs_segment(strain_basis_order=0, gauss_points=gauss_points))
 
-    return GVS(
+    return GVS.from_segments(
         segments=segments,
-        g=[0.0, 0.0, 9.81],
+        gravity=jnp.array([0.0, 0.0, 9.81]),
+        backend=backend,
+    )
+
+
+def _gvs_basis_order_factory(
+    strain_basis_order: int,
+    gauss_points: int = 5,
+    *,
+    backend: ExecutionBackend = "auto",
+) -> GVS:
+    return GVS.from_segments(
+        segments=[
+            _gvs_segment(
+                strain_basis_order=strain_basis_order,
+                gauss_points=gauss_points,
+            )
+        ],
+        gravity=jnp.array([0.0, 0.0, 9.81]),
+        backend=backend,
+    )
+
+
+def get_gvs_basis_order_system_config() -> SystemConfig:
+    """Return the GVS configuration that sweeps basis order for one link."""
+
+    return SystemConfig(
+        factory=_gvs_basis_order_factory,
+        size_label="strain_basis_order",
+        build_context=_gvs_context,
+        gauss_factory=_gvs_basis_order_factory,
+        default_gauss_points=5,
+        min_gauss_points=5,
+        supports_backend=True,
     )
 
 
 def _gvs_context(system: GVS) -> MutableMapping[str, Array]:
-    dof = system.num_dofs
+    dof = system.num_internal_dofs
     q = jnp.linspace(-0.12, 0.12, dof)
     qd = jnp.linspace(0.16, -0.16, dof)
     ctx: MutableMapping[str, Array] = {
@@ -301,6 +422,7 @@ def get_system_registry() -> Mapping[str, SystemConfig]:
             build_context=_planar_pcs_context,
             gauss_factory=_planar_pcs_factory,
             default_gauss_points=5,
+            supports_backend=True,
         ),
         "pcs": SystemConfig(
             factory=_pcs_factory,
@@ -308,6 +430,7 @@ def get_system_registry() -> Mapping[str, SystemConfig]:
             build_context=_pcs_context,
             gauss_factory=_pcs_factory,
             default_gauss_points=5,
+            supports_backend=True,
         ),
         "gvs": SystemConfig(
             factory=_gvs_factory,
@@ -316,6 +439,7 @@ def get_system_registry() -> Mapping[str, SystemConfig]:
             gauss_factory=_gvs_factory,
             default_gauss_points=5,
             min_gauss_points=5,
+            supports_backend=True,
         ),
     }
 
@@ -325,16 +449,22 @@ def add_system_selection_args(
     registry: Mapping[str, Any],
     *,
     default_segment_counts: Sequence[int],
+    default_systems: Sequence[str] | None = None,
 ) -> None:
     """Attach shared --systems/--segment-counts arguments to a parser."""
 
     systems = list(registry.keys())
+    selected_systems = systems if default_systems is None else list(default_systems)
+    selected_systems = normalize_system_names(selected_systems, registry)
     parser.add_argument(
         "--systems",
         nargs="*",
-        default=systems,
-        choices=systems,
-        help="Systems to benchmark (default: all)",
+        default=selected_systems,
+        metavar="SYSTEM",
+        help=(
+            "Systems to benchmark. Available: "
+            f"{', '.join(systems)}. CamelCase names such as PCS and GVS are accepted."
+        ),
     )
     parser.add_argument(
         "--segment-counts",
@@ -343,6 +473,38 @@ def add_system_selection_args(
         default=list(default_segment_counts),
         help="Sequence of link/segment counts to benchmark",
     )
+
+
+def normalize_system_names(
+    values: Sequence[str],
+    registry: Mapping[str, Any],
+) -> list[str]:
+    """Normalize CLI system names while accepting snake_case and CamelCase."""
+
+    normalized: list[str] = []
+    unknown: list[str] = []
+    compact_registry = {name.replace("_", "").lower(): name for name in registry}
+    for value in values:
+        name = str(value)
+        snake = name.strip().replace("-", "_").lower()
+        if snake in registry:
+            canonical = snake
+        else:
+            canonical = compact_registry.get(snake.replace("_", ""))
+
+        if canonical is None:
+            unknown.append(name)
+            continue
+        if canonical not in normalized:
+            normalized.append(canonical)
+
+    if unknown:
+        available = ", ".join(registry.keys())
+        raise ValueError(
+            "Unknown system name(s): "
+            f"{', '.join(unknown)}. Available systems: {available}."
+        )
+    return normalized
 
 
 def add_gauss_point_args(parser: argparse.ArgumentParser) -> None:
@@ -357,6 +519,29 @@ def add_gauss_point_args(parser: argparse.ArgumentParser) -> None:
             "Optional sweep of Gauss-Legendre quadrature orders/interior point "
             "counts. Applies only to systems with quadrature-driven dynamics; "
             "PCS/GVS include two zero-weight endpoints internally."
+        ),
+    )
+
+
+def add_backend_arg(parser: argparse.ArgumentParser) -> None:
+    """Attach the shared system-execution backend argument to a parser.
+
+    Args:
+        parser: Argument parser used by a benchmark command.
+
+    Returns:
+        None. The ``--backend`` option is added to ``parser`` in place.
+    """
+
+    parser.add_argument(
+        "--backend",
+        choices=("auto", "jax", "warp"),
+        default="auto",
+        help=(
+            "Execution backend for supported GVS, PCS, and PlanarPCS dynamics "
+            "(default: auto). Systems without an alternative backend continue "
+            "to use JAX. Run different backends in separate processes for "
+            "controlled comparisons."
         ),
     )
 
@@ -390,17 +575,72 @@ def build_system_with_gauss_points(
     config: Any,
     size: int,
     gauss_points: int | None,
+    *,
+    backend: ExecutionBackend = "auto",
 ) -> Any:
-    """Build a configured benchmark system, optionally overriding quadrature."""
+    """Build a benchmark system with optional quadrature and backend overrides.
+
+    The backend keyword is forwarded only to configurations that declare
+    ``supports_backend``. JAX-only systems therefore remain constructible when
+    a heterogeneous benchmark sweep requests Warp for the supported continuum
+    systems.
+
+    Args:
+        config: System configuration containing normal and optional
+            Gauss-point factories.
+        size: Link count, segment count, or other configured size value.
+        gauss_points: Optional Gauss-point override.
+        backend: Requested execution backend for supported systems.
+
+    Returns:
+        Constructed benchmark system.
+
+    Raises:
+        ValueError: If a Gauss-point override is requested for a system that
+            does not support quadrature sweeps.
+    """
+
+    factory_kwargs = (
+        {"backend": backend} if getattr(config, "supports_backend", False) else {}
+    )
 
     if gauss_points is None:
-        return config.factory(size)
+        return config.factory(size, **factory_kwargs)
     if not getattr(config, "supports_gauss_points", False):
         raise ValueError(
             f"{getattr(config, 'size_label', 'system')} does not support "
             "Gaussian quadrature point sweeps."
         )
-    return config.gauss_factory(size, gauss_points)
+    return config.gauss_factory(size, gauss_points, **factory_kwargs)
+
+
+def resolve_execution_backend(
+    system: Any,
+    *,
+    platform: str | None = None,
+) -> str:
+    """Resolve the backend that a constructed system will use for dynamics.
+
+    Args:
+        system: Constructed benchmark system. Systems without a ``backend``
+            attribute are treated as JAX-only.
+        platform: Optional active JAX platform used to resolve ``"auto"``.
+            Defaults to :func:`jax.default_backend`.
+
+    Returns:
+        ``"jax"`` or ``"warp"``.
+
+    Raises:
+        ValueError: If a system exposes an unknown configured backend.
+    """
+
+    configured = getattr(system, "backend", "jax")
+    if configured == "auto":
+        active_platform = jax.default_backend() if platform is None else platform
+        return "warp" if active_platform == "gpu" else "jax"
+    if configured not in ("jax", "warp"):
+        raise ValueError(f"Unknown configured execution backend {configured!r}.")
+    return str(configured)
 
 
 def system_gauss_point_metadata(system: Any) -> tuple[int | None, int | None]:
@@ -416,6 +656,8 @@ def system_gauss_point_metadata(system: Any) -> tuple[int | None, int | None]:
     if hasattr(system, "num_gauss_points") and hasattr(
         system, "num_integration_points"
     ):
+        if system.num_gauss_points is None or system.num_integration_points is None:
+            return None, None
         return int(system.num_gauss_points), int(system.num_integration_points)
     return None, None
 

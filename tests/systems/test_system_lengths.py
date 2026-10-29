@@ -1,0 +1,218 @@
+from pathlib import Path
+
+import jax
+import jax.numpy as jnp
+import pytest
+from numpy.testing import assert_allclose
+from system_param_builders import (
+    articulated_params,
+    pcs_params,
+    pendulum_params,
+    planar_pcs_params,
+)
+
+from soromox.actuation import (
+    ArticulatedTendonActuator,
+    ThreadlikeActuator,
+    ThreadlikeRouting,
+)
+from soromox.systems import (
+    GVS,
+    PCS,
+    ArticulatedSoftRobot,
+    GVSSegment,
+    ISupport,
+    ISupportParams,
+    ISupportStructure,
+    JointSpec,
+    LinkSpec,
+    PCSStructure,
+    Pendulum,
+    PlanarHSA,
+    PlanarHSAParams,
+    PlanarHSAStructure,
+    PlanarPCS,
+    StrainBasisSpec,
+)
+
+jax.config.update("jax_enable_x64", True)
+
+
+def _pcs_params(length):
+    num_segments = len(length)
+    return pcs_params(
+        length=jnp.asarray(length, dtype=jnp.float64),
+        radius=0.02 * jnp.ones((num_segments,), dtype=jnp.float64),
+        density=1000.0 * jnp.ones((num_segments,), dtype=jnp.float64),
+        young_modulus=1e6 * jnp.ones((num_segments,), dtype=jnp.float64),
+        shear_modulus=1e5 * jnp.ones((num_segments,), dtype=jnp.float64),
+        damping_matrix=jnp.eye(6 * num_segments, dtype=jnp.float64),
+        gravity=jnp.array([0.0, 0.0, -9.81], dtype=jnp.float64),
+    )
+
+
+def _planar_pcs_params(length):
+    num_segments = len(length)
+    return planar_pcs_params(
+        length=jnp.asarray(length, dtype=jnp.float64),
+        radius=0.02 * jnp.ones((num_segments,), dtype=jnp.float64),
+        density=1000.0 * jnp.ones((num_segments,), dtype=jnp.float64),
+        young_modulus=1e6 * jnp.ones((num_segments,), dtype=jnp.float64),
+        shear_modulus=1e5 * jnp.ones((num_segments,), dtype=jnp.float64),
+        damping_matrix=jnp.eye(3 * num_segments, dtype=jnp.float64),
+        gravity=jnp.array([0.0, -9.81], dtype=jnp.float64),
+    )
+
+
+def _pendulum_params(length):
+    length = jnp.asarray(length, dtype=jnp.float64)
+    num_links = len(length)
+    return pendulum_params(
+        mass=jnp.arange(1, num_links + 1, dtype=jnp.float64),
+        moment_inertia=0.1 * jnp.arange(1, num_links + 1, dtype=jnp.float64),
+        length=length,
+        center_of_mass_length=0.5 * length,
+        gravity=jnp.array([0.0, -9.81], dtype=jnp.float64),
+    )
+
+
+def _articulated_robot():
+    p_tip = jnp.array(
+        [[0.3, 0.0, 0.0], [0.0, 0.4, 0.0], [0.0, 0.0, 0.5]], dtype=jnp.float64
+    )
+    num_links = p_tip.shape[0]
+    joint_screw = jnp.zeros((num_links, 6), dtype=jnp.float64).at[:, 2].set(1.0)
+    inertia = jnp.stack(
+        [jnp.eye(3, dtype=jnp.float64) * (0.01 + 0.01 * i) for i in range(num_links)]
+    )
+    return ArticulatedSoftRobot(
+        articulated_params(
+            joint_screw=joint_screw,
+            tip_position=p_tip,
+            center_of_mass_position=0.5 * p_tip,
+            mass=jnp.ones((num_links,), dtype=jnp.float64),
+            center_of_mass_inertia=inertia,
+            gravity=jnp.array([0.0, 0.0, -9.81], dtype=jnp.float64),
+        )
+    )
+
+
+def _segments():
+    lengths = [0.11, 0.13, 0.17]
+    return [
+        GVSSegment(
+            link=LinkSpec.circular(
+                young_modulus=1e6,
+                shear_modulus=1e6 / 2.9,
+                density=1000.0,
+                material_damping_coefficient=0.0,
+                length=length,
+                radius=0.02,
+                reference_strain=[0, 0, 0, 1, 0, 0],
+            ),
+            joint=JointSpec(type="fixed"),
+            basis=StrainBasisSpec(
+                type="monomial",
+                strain_selector=[1, 1, 1, 1, 1, 1],
+                basis_order=[0, 0, 0, 0, 0, 0],
+            ),
+            num_gauss_points=5,
+        )
+        for length in lengths
+    ]
+
+
+def _tendon_routing(num_segments):
+    return ThreadlikeRouting.linear(
+        intercept=jnp.array([0.0, 0.005, 0.005], dtype=jnp.float64),
+        end_segment_index=(num_segments - 1,),
+    )
+
+
+def _planar_tendon_routing(num_segments):
+    offsets = 0.02 * jnp.ones((num_segments, 2), dtype=jnp.float64).at[:, 1].set(-1.0)
+    return ThreadlikeRouting.linear(
+        intercept=jnp.stack(
+            (
+                jnp.zeros((2 * num_segments,), dtype=jnp.float64),
+                offsets.reshape(-1),
+                jnp.zeros((2 * num_segments,), dtype=jnp.float64),
+            ),
+            axis=-1,
+        ),
+        end_segment_index=tuple(jnp.repeat(jnp.arange(num_segments), 2).tolist()),
+    )
+
+
+def _isupport_robot():
+    body = _pcs_params([0.08, 0.12])
+    params = ISupportParams(
+        **body.__dict__,
+        chamber_inner_radius=jnp.array([0.002, 0.002], dtype=jnp.float64),
+        chamber_outer_radius=jnp.array([0.004, 0.004], dtype=jnp.float64),
+        chamber_distance=jnp.array([0.01, 0.01], dtype=jnp.float64),
+        chamber_azimuth_angles=jnp.tile(
+            2 * jnp.pi * jnp.arange(3, dtype=jnp.float64) / 3, (2, 1)
+        ),
+    )
+    return ISupport(
+        params=params,
+        structure=ISupportStructure(
+            num_gauss_points=1, rigid_segment_selector=(False, False)
+        ),
+    )
+
+
+def _planar_hsa_robot():
+    params = PlanarHSAParams.from_npz(
+        Path(__file__).resolve().parents[2]
+        / "assets"
+        / "robot_parameters"
+        / "planar_hsa"
+        / "fpu_control.npz"
+    )
+    return PlanarHSA(
+        params=params,
+        structure=PlanarHSAStructure(),
+    )
+
+
+@pytest.mark.parametrize(
+    "robot",
+    [
+        PCS(params=_pcs_params([0.08, 0.12, 0.2])),
+        PlanarPCS(params=_planar_pcs_params([0.08, 0.12, 0.2])),
+        Pendulum(_pendulum_params([0.7, 0.9, 1.1])),
+        Pendulum(
+            _pendulum_params([0.7, 0.9, 1.1]),
+            actuators=ArticulatedTendonActuator.from_routing(
+                jnp.tril(jnp.ones((3, 3), dtype=jnp.float64))
+            ),
+        ),
+        _articulated_robot(),
+        GVS.from_segments(_segments(), gravity=jnp.array([0.0, 0.0, -9.81])),
+        GVS.from_segments(
+            _segments(),
+            gravity=jnp.array([0.0, 0.0, -9.81]),
+            actuators=ThreadlikeActuator.tendons(_tendon_routing(3)),
+        ),
+        PCS(
+            params=_pcs_params([0.08, 0.12, 0.2]),
+            structure=PCSStructure(num_gauss_points=3),
+            actuators=ThreadlikeActuator.tendons(_tendon_routing(3)),
+        ),
+        PlanarPCS(
+            params=_planar_pcs_params([0.08, 0.12, 0.2]),
+            actuators=ThreadlikeActuator.tendons(_planar_tendon_routing(3)),
+        ),
+        _isupport_robot(),
+        _planar_hsa_robot(),
+    ],
+)
+def test_length_returns_total_robot_length(robot):
+    assert_allclose(
+        robot.length,
+        jnp.sum(jnp.asarray(robot.segment_length)),
+        rtol=1e-12,
+        atol=1e-12,
+    )

@@ -1,4 +1,8 @@
-from .pendulum import Pendulum
-from .tendon_actuated_pendulum import TendonActuatedPendulum
+from soromox.systems.pendulum.params import PendulumParams
 
-__all__ = ["Pendulum", "TendonActuatedPendulum"]
+from .pendulum import Pendulum
+
+__all__ = [
+    "Pendulum",
+    "PendulumParams",
+]

@@ -11,18 +11,30 @@ References:
     PhD Thesis, Sapienza University of Rome.
 """
 
+# ruff: noqa: E402
+
 import jax
 
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import pytest
 from numpy.testing import assert_allclose
+from system_param_builders import (
+    pcs_params,
+    pendulum_params,
+)
 
+from soromox.actuation import (
+    ArticulatedTendonActuator,
+    ThreadlikeActuator,
+    ThreadlikeRouting,
+)
 from soromox.control.reference_trajectory import ReferenceTrajectory
 from soromox.coordinate_transformations import ActuationSpaceDynamics
 from soromox.systems import (
-    TendonActuatedPCS,
-    TendonActuatedPendulum,
+    PCS,
+    PCSStructure,
+    Pendulum,
 )
 
 # -----------------------
@@ -32,64 +44,67 @@ from soromox.systems import (
 
 @pytest.fixture
 def fully_actuated_pendulum():
-    """Create a 3-link fully actuated tendon pendulum (identity routing)."""
-    params = {
-        "m": jnp.array([1.0, 1.0, 1.0]),
-        "I": jnp.array([0.1, 0.1, 0.1]),
-        "L": jnp.array([0.5, 0.5, 0.5]),
-        "Lc": jnp.array([0.25, 0.25, 0.25]),
-        "g": jnp.array([0.0, -9.81]),
-        "K": jnp.eye(3) * 10.0,
-        "D": jnp.eye(3) * 0.5,
-    }
-    return TendonActuatedPendulum(params)
+    """Create a 3-link fully actuated tendon pendulum."""
+    body = pendulum_params(
+        mass=jnp.array([1.0, 1.0, 1.0]),
+        moment_inertia=jnp.array([0.1, 0.1, 0.1]),
+        length=jnp.array([0.5, 0.5, 0.5]),
+        center_of_mass_length=jnp.array([0.25, 0.25, 0.25]),
+        gravity=jnp.array([0.0, -9.81]),
+        joint_stiffness=jnp.eye(3) * 10.0,
+        joint_damping=jnp.eye(3) * 0.5,
+    )
+    return Pendulum(
+        body,
+        actuators=ArticulatedTendonActuator.from_routing(jnp.tril(jnp.ones((3, 3)))),
+    )
 
 
 @pytest.fixture
 def underactuated_pendulum():
     """Create a 3-link underactuated tendon pendulum (2 tendons on 3 joints)."""
-    params = {
-        "m": jnp.array([1.0, 1.0, 1.0]),
-        "I": jnp.array([0.1, 0.1, 0.1]),
-        "L": jnp.array([0.5, 0.5, 0.5]),
-        "Lc": jnp.array([0.25, 0.25, 0.25]),
-        "g": jnp.array([0.0, -9.81]),
-        "K": jnp.eye(3) * 10.0,
-        "D": jnp.eye(3) * 0.5,
-    }
+    body = pendulum_params(
+        mass=jnp.array([1.0, 1.0, 1.0]),
+        moment_inertia=jnp.array([0.1, 0.1, 0.1]),
+        length=jnp.array([0.5, 0.5, 0.5]),
+        center_of_mass_length=jnp.array([0.25, 0.25, 0.25]),
+        gravity=jnp.array([0.0, -9.81]),
+        joint_stiffness=jnp.eye(3) * 10.0,
+        joint_damping=jnp.eye(3) * 0.5,
+    )
     # Valid underactuated tendon routing (tendons can't skip joints)
     # Tendon 1: routes through joints 0 and 1 only (attaches at joint 1)
     # Tendon 2: routes through all 3 joints (attaches at joint 2)
-    tendon_params = {
-        "R_at": jnp.array(
-            [
-                [1.0, 1.0, 0.0],  # Tendon 1: routes through joints 0,1
-                [1.0, 1.0, 1.0],  # Tendon 2: routes through all 3 joints
-            ]
-        )
-    }
-    return TendonActuatedPendulum(params, tendon_params)
+    active_routing_matrix = jnp.array(
+        [
+            [1.0, 1.0, 0.0],  # Tendon 1: routes through joints 0,1
+            [1.0, 1.0, 1.0],  # Tendon 2: routes through all 3 joints
+        ]
+    )
+    return Pendulum(
+        body,
+        actuators=ArticulatedTendonActuator.from_routing(active_routing_matrix),
+    )
 
 
 @pytest.fixture
 def fully_actuated_pcs():
-    """Create a 1-segment fully actuated TendonActuatedPCS (2 tendons on 1 segment with bending-only).
+    """Create a 1-segment fully actuated threadlike PCS.
 
     For a truly fully-actuated system, we use a single segment with 2 bending DOFs
     (kappa_y, kappa_z) and 2 tendons placed at different offsets.
     """
-    num_segments = 1
     # Note: D must be provided in full strain space (num_strains x num_strains = 6x6 for 1 segment)
     # The PCS.damping_matrix() method projects it to active strain space using B_xi
-    params = {
-        "L": jnp.array([0.1]),
-        "r": jnp.array([0.01]),
-        "rho": jnp.array([1000.0]),
-        "E": jnp.array([1e6]),
-        "G": jnp.array([1e5]),
-        "g": jnp.array([0.0, 0.0, -9.81]),
-        "D": jnp.eye(6) * 0.01,  # Full strain space (6 strains × 1 segment)
-    }
+    body = pcs_params(
+        length=jnp.array([0.1]),
+        radius=jnp.array([0.01]),
+        density=jnp.array([1000.0]),
+        young_modulus=jnp.array([1e6]),
+        shear_modulus=jnp.array([1e5]),
+        gravity=jnp.array([0.0, 0.0, -9.81]),
+        damping_matrix=jnp.eye(6) * 0.01,  # Full strain space (6 strains x 1 segment)
+    )
     # Select only bending strains (kappa_y, kappa_z = 2 DOFs total)
     # Strain components per segment: [kappa_x, kappa_y, kappa_z, sigma_x, sigma_y, sigma_z]
     strain_selector = jnp.array(
@@ -105,36 +120,33 @@ def fully_actuated_pcs():
     # 2 tendons for 2 DOFs (fully actuated bending)
     # Tendon at +y creates moment around z (affects kappa_z)
     # Tendon at +z creates moment around y (affects kappa_y)
-    tendon_routing_params = {
-        "ry": jnp.array([0.005, 0.0]),  # first tendon at +y
-        "my": jnp.array([0.0, 0.0]),  # slope in y
-        "rz": jnp.array([0.0, 0.005]),  # second tendon at +z
-        "mz": jnp.array([0.0, 0.0]),  # slope in z
-        "idx_seg_att": jnp.array([0, 0]),  # both attach at segment 0
-    }
-    return TendonActuatedPCS(
-        num_segments,
-        params,
-        strain_selector=strain_selector,
-        active_tendon_routing_params=tendon_routing_params,
+    tendon_routing = ThreadlikeRouting.linear(
+        intercept=jnp.array(
+            [[0.0, 0.005, 0.0], [0.0, 0.0, 0.005]]
+        ),  # first tendon at +y, second at +z
+        end_segment_index=(0, 0),
+    )
+    return PCS(
+        body,
+        structure=PCSStructure(strain_selector=strain_selector),
+        actuators=ThreadlikeActuator.tendons(tendon_routing),
     )
 
 
 @pytest.fixture
 def underactuated_pcs():
-    """Create a 2-segment underactuated TendonActuatedPCS (2 tendons on 4 DOFs)."""
-    num_segments = 2
+    """Create a 2-segment underactuated threadlike PCS."""
     # Note: D must be provided in full strain space (num_strains x num_strains = 12x12)
     # The PCS.damping_matrix() method projects it to active strain space using B_xi
-    params = {
-        "L": jnp.array([0.1, 0.1]),
-        "r": jnp.array([0.01, 0.01]),
-        "rho": jnp.array([1000.0, 1000.0]),
-        "E": jnp.array([1e6, 1e6]),
-        "G": jnp.array([1e5, 1e5]),
-        "g": jnp.array([0.0, 0.0, -9.81]),
-        "D": jnp.eye(12) * 0.01,  # Full strain space (6 strains × 2 segments)
-    }
+    body = pcs_params(
+        length=jnp.array([0.1, 0.1]),
+        radius=jnp.array([0.01, 0.01]),
+        density=jnp.array([1000.0, 1000.0]),
+        young_modulus=jnp.array([1e6, 1e6]),
+        shear_modulus=jnp.array([1e5, 1e5]),
+        gravity=jnp.array([0.0, 0.0, -9.81]),
+        damping_matrix=jnp.eye(12) * 0.01,  # Full strain space (6 strains x 2 segments)
+    )
     # Select only bending strains (kappa_y, kappa_z per segment = 4 DOFs total)
     strain_selector = jnp.array(
         [
@@ -154,18 +166,16 @@ def underactuated_pcs():
     )
     # 2 tendons for 4 DOFs (underactuated)
     # Use tendons at different offsets to ensure non-singular actuation matrix
-    tendon_routing_params = {
-        "ry": jnp.array([0.005, 0.0]),  # first tendon at +y, second at origin in y
-        "my": jnp.array([0.0, 0.0]),  # slope in y
-        "rz": jnp.array([0.0, 0.005]),  # first tendon at origin in z, second at +z
-        "mz": jnp.array([0.0, 0.0]),  # slope in z
-        "idx_seg_att": jnp.array([1, 1]),  # both tendons attach at distal end
-    }
-    return TendonActuatedPCS(
-        num_segments,
-        params,
-        strain_selector=strain_selector,
-        active_tendon_routing_params=tendon_routing_params,
+    tendon_routing = ThreadlikeRouting.linear(
+        intercept=jnp.array(
+            [[0.0, 0.005, 0.0], [0.0, 0.0, 0.005]]
+        ),  # first tendon at +y, second at +z
+        end_segment_index=(1, 1),
+    )
+    return PCS(
+        body,
+        structure=PCSStructure(strain_selector=strain_selector),
+        actuators=ThreadlikeActuator.tendons(tendon_routing),
     )
 
 
@@ -178,7 +188,7 @@ def random_configuration(robot, key=None):
     """Generate a small random configuration for a robot."""
     if key is None:
         key = jax.random.PRNGKey(0)
-    return 0.1 * jax.random.normal(key, shape=(robot.num_dofs,))
+    return 0.1 * jax.random.normal(key, shape=(robot.num_internal_dofs,))
 
 
 # -----------------------
@@ -195,7 +205,7 @@ class TestActuationSpaceDynamicsInit:
         asd = ActuationSpaceDynamics(robot)
 
         assert asd.n_actuated == robot.num_actuators
-        assert asd.n_unactuated == robot.num_dofs - robot.num_actuators
+        assert asd.n_unactuated == robot.num_internal_dofs - robot.num_actuators
         assert asd.n_actuated == 3
         assert asd.n_unactuated == 0
 
@@ -205,7 +215,7 @@ class TestActuationSpaceDynamicsInit:
         asd = ActuationSpaceDynamics(robot)
 
         assert asd.n_actuated == robot.num_actuators
-        assert asd.n_unactuated == robot.num_dofs - robot.num_actuators
+        assert asd.n_unactuated == robot.num_internal_dofs - robot.num_actuators
         assert asd.n_actuated == 2
         assert asd.n_unactuated == 1
 
@@ -245,7 +255,7 @@ class TestCoordinateTransformations:
         y_a = asd.actuated_coordinates(q)
 
         # For identity routing, actuated coords equal tendon lengths
-        expected = robot.actuated_coordinates(q)
+        expected = robot.actuator_coordinates(q)
         assert_allclose(y_a, expected, rtol=1e-10)
 
     def test_actuated_coordinates_underactuated(self, underactuated_pendulum):
@@ -257,7 +267,7 @@ class TestCoordinateTransformations:
         y_a = asd.actuated_coordinates(q)
 
         # Actuated coords should equal tendon lengths
-        expected = robot.actuated_coordinates(q)
+        expected = robot.actuator_coordinates(q)
         assert_allclose(y_a, expected, rtol=1e-10)
 
     def test_unactuated_coordinates(self, underactuated_pendulum):
@@ -284,7 +294,7 @@ class TestCoordinateTransformations:
         y_a = asd.actuated_coordinates(q)
         y_u = asd.unactuated_coordinates(q)
 
-        assert y.shape == (robot.num_dofs,)
+        assert y.shape == (robot.num_internal_dofs,)
         assert_allclose(y[: asd.n_actuated], y_a, rtol=1e-10)
         assert_allclose(y[asd.n_actuated :], y_u, rtol=1e-10)
 
@@ -297,21 +307,23 @@ class TestCoordinateTransformations:
 class TestJacobians:
     """Tests for Jacobian computations."""
 
-    def test_jacobian_actuated_equals_actuation_matrix_transpose(
+    def test_jacobian_actuated_equals_robot_coordinate_jacobian(
         self, underactuated_pendulum
     ):
-        """Test that jacobian_actuated equals A_at^T."""
+        """Test that the transformed Jacobian uses coordinate kinematics."""
         robot = underactuated_pendulum
         asd = ActuationSpaceDynamics(robot)
 
         q = jnp.array([0.1, 0.2, 0.3])
         J_a = asd.jacobian_actuated(q)
-        A_at = robot.actuation_matrix(q)
+        expected = robot.actuator_coordinate_jacobian(q)
 
-        assert_allclose(J_a, A_at.T, rtol=1e-10)
+        assert_allclose(J_a, expected, rtol=1e-10)
 
-    def test_jacobian_unactuated_equals_h_unactuated(self, underactuated_pendulum):
-        """Test that jacobian_unactuated equals H_unactuated."""
+    def test_unactuated_coordinate_jacobian_matches_configured_mapping(
+        self, underactuated_pendulum
+    ):
+        """Test the unactuated-coordinate Jacobian against its configured map."""
         robot = underactuated_pendulum
         asd = ActuationSpaceDynamics(robot)
 
@@ -328,7 +340,7 @@ class TestJacobians:
         q = jnp.array([0.1, 0.2, 0.3])
         J = asd.jacobian(q)
 
-        assert J.shape == (robot.num_dofs, robot.num_dofs)
+        assert J.shape == (robot.num_internal_dofs, robot.num_internal_dofs)
 
     def test_jacobian_is_invertible(self, underactuated_pendulum):
         """Test that full Jacobian is invertible."""
@@ -340,7 +352,7 @@ class TestJacobians:
         J_inv = asd.jacobian_inverse(q)
 
         # J @ J_inv should be identity
-        assert_allclose(J @ J_inv, jnp.eye(robot.num_dofs), atol=1e-10)
+        assert_allclose(J @ J_inv, jnp.eye(robot.num_internal_dofs), atol=1e-10)
 
     def test_jacobian_stacks_correctly(self, underactuated_pendulum):
         """Test that jacobian stacks actuated and unactuated Jacobians."""
@@ -403,7 +415,7 @@ class TestDynamicsMatrices:
         qd = jnp.array([0.01, 0.02, 0.03])
         eta_y = asd.coriolis_matrix(q, qd)
 
-        assert eta_y.shape == (robot.num_dofs, robot.num_dofs)
+        assert eta_y.shape == (robot.num_internal_dofs, robot.num_internal_dofs)
 
     def test_damping_matrix_transformation(self, underactuated_pendulum):
         """Test that D_y = J^{-T} @ D @ J^{-1}."""
@@ -467,6 +479,18 @@ class TestForces:
         expected = J_inv.T @ D @ qd
         assert_allclose(tau_d_y, expected, rtol=1e-10)
 
+    def test_potential_force_sums_conservative_forces(self, underactuated_pendulum):
+        """Test that potential_force sums gravitational and elastic forces."""
+        robot = underactuated_pendulum
+        asd = ActuationSpaceDynamics(robot)
+
+        q = jnp.array([0.1, 0.2, 0.3])
+        tau_pot_y = asd.potential_force(q)
+        expected = asd.gravitational_force(q) + asd.elastic_force(q)
+
+        assert tau_pot_y.shape == (robot.num_internal_dofs,)
+        assert_allclose(tau_pot_y, expected, rtol=1e-10)
+
 
 # -----------------------
 # Actuation matrix tests
@@ -485,7 +509,7 @@ class TestActuationMatrix:
         A_y = asd.actuation_matrix(q)
 
         # For fully actuated: A_y = I
-        assert_allclose(A_y, jnp.eye(robot.num_dofs), rtol=1e-10)
+        assert_allclose(A_y, jnp.eye(robot.num_internal_dofs), rtol=1e-10, atol=1e-12)
 
     def test_actuation_matrix_structure_underactuated(self, underactuated_pendulum):
         """Test actuation matrix structure for underactuated system."""
@@ -500,10 +524,10 @@ class TestActuationMatrix:
         n_u = asd.n_unactuated
 
         # Top block should be identity
-        assert_allclose(A_y[:n_a, :n_a], jnp.eye(n_a), rtol=1e-10)
+        assert_allclose(A_y[:n_a, :n_a], jnp.eye(n_a), rtol=1e-10, atol=1e-12)
 
         # Bottom block should be zeros
-        assert_allclose(A_y[n_a:, :], jnp.zeros((n_u, n_a)), rtol=1e-10)
+        assert_allclose(A_y[n_a:, :], jnp.zeros((n_u, n_a)), rtol=1e-10, atol=1e-12)
 
     def test_actuation_matrix_shape(self, underactuated_pendulum):
         """Test actuation matrix has correct shape."""
@@ -513,7 +537,7 @@ class TestActuationMatrix:
         q = jnp.array([0.1, 0.2, 0.3])
         A_y = asd.actuation_matrix(q)
 
-        assert A_y.shape == (robot.num_dofs, robot.num_actuators)
+        assert A_y.shape == (robot.num_internal_dofs, robot.num_actuators)
 
 
 # -----------------------
@@ -524,13 +548,13 @@ class TestActuationMatrix:
 class TestIntegration:
     """Integration tests combining multiple components."""
 
-    def test_actuated_coordinates_alias(self, fully_actuated_pendulum):
-        """Test that actuated_coordinates is an alias of active_tendon_length for the TendonActuatedPendulum."""
+    def test_pendulum_actuator_coordinates(self, fully_actuated_pendulum):
+        """Test the pendulum's common actuator-coordinate contract."""
         robot = fully_actuated_pendulum
         q = jnp.array([0.1, 0.2, 0.3])
 
-        tendon_lengths = robot.active_tendon_length(q)
-        actuation_coords = robot.actuated_coordinates(q)
+        tendon_lengths = robot.actuators[0].coordinates(robot, q)
+        actuation_coords = robot.actuator_coordinates(q)
 
         assert_allclose(tendon_lengths, actuation_coords, rtol=1e-10)
 
@@ -556,6 +580,22 @@ class TestIntegration:
         assert G_y.shape == (3,)
         assert tau_el_y.shape == (3,)
 
+    def test_dynamics_terms_match_individual_methods(self, underactuated_pendulum):
+        """Test dynamics_terms returns the individual actuation-space terms."""
+        robot = underactuated_pendulum
+        asd = ActuationSpaceDynamics(robot)
+
+        q = jnp.array([0.1, 0.2, 0.3])
+        qd = jnp.array([0.01, 0.02, 0.03])
+        M_y, Cyd, G_y = asd.dynamics_terms(q, qd)
+
+        assert M_y.shape == (3, 3)
+        assert Cyd.shape == (3,)
+        assert G_y.shape == (3,)
+        assert_allclose(M_y, asd.inertia_matrix(q), rtol=1e-10)
+        assert_allclose(Cyd, asd.coriolis_force(q, qd), rtol=1e-10)
+        assert_allclose(G_y, asd.gravitational_force(q), rtol=1e-10)
+
     def test_jit_compilation(self, underactuated_pendulum):
         """Test that all methods work correctly (they are already JIT-compiled via @eqx.filter_jit)."""
         robot = underactuated_pendulum
@@ -575,8 +615,10 @@ class TestIntegration:
         _ = asd.damping_matrix(q)
         _ = asd.elastic_force(q)
         _ = asd.gravitational_force(q)
+        _ = asd.potential_force(q)
         _ = asd.damping_force(q, qd)
         _ = asd.coriolis_force(q, qd)
+        _ = asd.dynamics_terms(q, qd)
         _ = asd.actuation_matrix(q)
 
 
@@ -786,14 +828,35 @@ class TestActuationSpaceDynamicsSystemIndependent:
         asd = ActuationSpaceDynamics(robot)
 
         assert asd.n_actuated == robot.num_actuators
-        assert asd.n_unactuated == robot.num_dofs - robot.num_actuators
-        assert asd.n_actuated + asd.n_unactuated == robot.num_dofs
+        assert asd.n_unactuated == robot.num_internal_dofs - robot.num_actuators
+        assert asd.n_actuated + asd.n_unactuated == robot.num_internal_dofs
+
+    def test_dynamics_terms_match_individual_methods(self, robot):
+        """Fused dynamics agree for articulated and nonlinear PCS mappings."""
+        asd = ActuationSpaceDynamics(robot)
+        q = random_configuration(robot)
+        qd = random_configuration(robot, key=jax.random.PRNGKey(1))
+
+        M_y, Cyd, G_y = asd.dynamics_terms(q, qd)
+
+        # Only GPU PCS uses the fused Warp reduction whose accumulation order
+        # differs from the individual JAX methods. Keep CPU/JAX and pendulum
+        # comparisons at the original stricter tolerance.
+        uses_gpu_warp = (
+            isinstance(robot, PCS)
+            and robot.backend in ("auto", "warp")
+            and jax.default_backend() == "gpu"
+        )
+        rtol = 1e-7 if uses_gpu_warp else 1e-9
+        assert_allclose(M_y, asd.inertia_matrix(q), rtol=rtol, atol=1e-12)
+        assert_allclose(Cyd, asd.coriolis_force(q, qd), rtol=rtol, atol=1e-12)
+        assert_allclose(G_y, asd.gravitational_force(q), rtol=rtol, atol=1e-12)
 
     def test_h_unactuated_shape(self, robot):
         """Test that H_unactuated has correct shape."""
         asd = ActuationSpaceDynamics(robot)
 
-        expected_shape = (asd.n_unactuated, robot.num_dofs)
+        expected_shape = (asd.n_unactuated, robot.num_internal_dofs)
         assert asd.H_unactuated.shape == expected_shape
 
     # -----------------------
@@ -810,12 +873,12 @@ class TestActuationSpaceDynamicsSystemIndependent:
         assert y_a.shape == (asd.n_actuated,)
 
     def test_actuated_coordinates_matches_robot(self, robot):
-        """Test actuated_coordinates matches robot's actuated_coordinates."""
+        """Test actuated_coordinates matches the robot actuator coordinates."""
         asd = ActuationSpaceDynamics(robot)
         q = random_configuration(robot)
 
         y_a = asd.actuated_coordinates(q)
-        expected = robot.actuated_coordinates(q)
+        expected = robot.actuator_coordinates(q)
 
         assert_allclose(y_a, expected, rtol=1e-10)
 
@@ -847,7 +910,7 @@ class TestActuationSpaceDynamicsSystemIndependent:
         y_a = asd.actuated_coordinates(q)
         y_u = asd.unactuated_coordinates(q)
 
-        assert y.shape == (robot.num_dofs,)
+        assert y.shape == (robot.num_internal_dofs,)
         assert_allclose(y[: asd.n_actuated], y_a, rtol=1e-10)
         assert_allclose(y[asd.n_actuated :], y_u, rtol=1e-10)
 
@@ -862,7 +925,7 @@ class TestActuationSpaceDynamicsSystemIndependent:
 
         J = asd.jacobian(q)
 
-        assert J.shape == (robot.num_dofs, robot.num_dofs)
+        assert J.shape == (robot.num_internal_dofs, robot.num_internal_dofs)
 
     def test_jacobian_is_invertible(self, robot):
         """Test that full Jacobian is invertible."""
@@ -873,7 +936,7 @@ class TestActuationSpaceDynamicsSystemIndependent:
         J_inv = asd.jacobian_inverse(q)
 
         # J @ J_inv should be identity
-        assert_allclose(J @ J_inv, jnp.eye(robot.num_dofs), atol=1e-8)
+        assert_allclose(J @ J_inv, jnp.eye(robot.num_internal_dofs), atol=1e-8)
 
     def test_jacobian_actuated_shape(self, robot):
         """Test jacobian_actuated has correct shape."""
@@ -882,17 +945,17 @@ class TestActuationSpaceDynamicsSystemIndependent:
 
         J_a = asd.jacobian_actuated(q)
 
-        assert J_a.shape == (asd.n_actuated, robot.num_dofs)
+        assert J_a.shape == (asd.n_actuated, robot.num_internal_dofs)
 
-    def test_jacobian_actuated_equals_actuation_matrix_transpose(self, robot):
-        """Test that jacobian_actuated equals A_at^T."""
+    def test_jacobian_actuated_equals_robot_coordinate_jacobian(self, robot):
+        """Test that jacobian_actuated uses the robot coordinate Jacobian."""
         asd = ActuationSpaceDynamics(robot)
         q = random_configuration(robot)
 
         J_a = asd.jacobian_actuated(q)
-        A_at = robot.actuation_matrix(q)
+        expected = robot.actuator_coordinate_jacobian(q)
 
-        assert_allclose(J_a, A_at.T, rtol=1e-10)
+        assert_allclose(J_a, expected, rtol=1e-10)
 
     def test_jacobian_stacks_correctly(self, robot):
         """Test that jacobian stacks actuated and unactuated Jacobians."""
@@ -949,7 +1012,7 @@ class TestActuationSpaceDynamicsSystemIndependent:
 
         eta_y = asd.coriolis_matrix(q, qd)
 
-        assert eta_y.shape == (robot.num_dofs, robot.num_dofs)
+        assert eta_y.shape == (robot.num_internal_dofs, robot.num_internal_dofs)
 
     def test_damping_matrix_transformation_formula(self, robot):
         """Test that D_y = J^{-T} @ D @ J^{-1}."""
@@ -1015,7 +1078,7 @@ class TestActuationSpaceDynamicsSystemIndependent:
 
         A_y = asd.actuation_matrix(q)
 
-        assert A_y.shape == (robot.num_dofs, robot.num_actuators)
+        assert A_y.shape == (robot.num_internal_dofs, robot.num_actuators)
 
     def test_actuation_matrix_structure(self, robot):
         """Test actuation matrix structure [[I], [0]]."""
@@ -1027,11 +1090,11 @@ class TestActuationSpaceDynamicsSystemIndependent:
         n_u = asd.n_unactuated
 
         # Top block should be identity
-        assert_allclose(A_y[:n_a, :n_a], jnp.eye(n_a), rtol=1e-10)
+        assert_allclose(A_y[:n_a, :n_a], jnp.eye(n_a), rtol=1e-10, atol=1e-12)
 
         # Bottom block should be zeros (if underactuated)
         if n_u > 0:
-            assert_allclose(A_y[n_a:, :], jnp.zeros((n_u, n_a)), rtol=1e-10)
+            assert_allclose(A_y[n_a:, :], jnp.zeros((n_u, n_a)), rtol=1e-10, atol=1e-12)
 
     def test_actuation_matrix_fully_actuated_is_identity(self, fully_actuated_robot):
         """Test actuation matrix is identity for fully actuated system."""
@@ -1041,7 +1104,7 @@ class TestActuationSpaceDynamicsSystemIndependent:
 
         A_y = asd.actuation_matrix(q)
 
-        assert_allclose(A_y, jnp.eye(robot.num_dofs), rtol=1e-10)
+        assert_allclose(A_y, jnp.eye(robot.num_internal_dofs), rtol=1e-10, atol=1e-12)
 
     # -----------------------
     # Reference trajectory conversion tests
@@ -1050,7 +1113,7 @@ class TestActuationSpaceDynamicsSystemIndependent:
     def test_convert_trajectory_position(self, robot):
         """Test position conversion for reference trajectory."""
         asd = ActuationSpaceDynamics(robot)
-        n_dof = robot.num_dofs
+        n_dof = robot.num_internal_dofs
 
         # Create a simple configuration-space trajectory
         ts = jnp.linspace(0.0, 1.0, 10)
@@ -1076,7 +1139,7 @@ class TestActuationSpaceDynamicsSystemIndependent:
     def test_convert_trajectory_velocity(self, robot):
         """Test velocity conversion for reference trajectory."""
         asd = ActuationSpaceDynamics(robot)
-        n_dof = robot.num_dofs
+        n_dof = robot.num_internal_dofs
 
         ts = jnp.linspace(0.0, 1.0, 10)
         x_des_ts = jnp.outer(ts, 0.1 * jnp.ones(n_dof))
@@ -1105,10 +1168,10 @@ class TestActuationSpaceDynamicsSystemIndependent:
 
         where Jd is the time derivative of the Jacobian. This is particularly
         important for systems with configuration-dependent actuation matrices
-        (like TendonActuatedPCS) where Jd ≠ 0.
+        (like PCS with threadlike actuation) where Jd ≠ 0.
         """
         asd = ActuationSpaceDynamics(robot)
-        n_dof = robot.num_dofs
+        n_dof = robot.num_internal_dofs
 
         # Create trajectory with non-zero velocity and acceleration
         # to test the Jd @ qd term
@@ -1142,8 +1205,8 @@ class TestActuationSpaceDynamicsSystemIndependent:
             J_qdd = J @ qdd
 
             # Compute Jd @ qd using JVP (same method as the implementation)
-            def J_times_qd(q_inner):
-                return asd.jacobian(q_inner) @ qd
+            def J_times_qd(q_inner, qd_current=qd):
+                return asd.jacobian(q_inner) @ qd_current
 
             Jd_qd = jax.jvp(J_times_qd, (q,), (qd,))[1]
 
@@ -1158,7 +1221,7 @@ class TestActuationSpaceDynamicsSystemIndependent:
     def test_convert_trajectory_function_based(self, robot):
         """Test function-based reference trajectory conversion."""
         asd = ActuationSpaceDynamics(robot)
-        n_dof = robot.num_dofs
+        n_dof = robot.num_internal_dofs
 
         def q_des_fn(t):
             return t * 0.1 * jnp.ones(n_dof)
@@ -1197,8 +1260,10 @@ class TestActuationSpaceDynamicsSystemIndependent:
         _ = asd.damping_matrix(q)
         _ = asd.elastic_force(q)
         _ = asd.gravitational_force(q)
+        _ = asd.potential_force(q)
         _ = asd.damping_force(q, qd)
         _ = asd.coriolis_force(q, qd)
+        _ = asd.dynamics_terms(q, qd)
         _ = asd.actuation_matrix(q)
 
     def test_dynamics_shapes_consistent(self, robot):
@@ -1206,16 +1271,22 @@ class TestActuationSpaceDynamicsSystemIndependent:
         asd = ActuationSpaceDynamics(robot)
         q = random_configuration(robot)
         qd = random_configuration(robot, key=jax.random.PRNGKey(1))
-        n_dof = robot.num_dofs
+        n_dof = robot.num_internal_dofs
 
         M_y = asd.inertia_matrix(q)
         eta_y = asd.coriolis_matrix(q, qd)
         D_y = asd.damping_matrix(q)
         G_y = asd.gravitational_force(q)
         tau_el_y = asd.elastic_force(q)
+        tau_pot_y = asd.potential_force(q)
+        M_terms, Cyd, G_terms = asd.dynamics_terms(q, qd)
 
         assert M_y.shape == (n_dof, n_dof)
         assert eta_y.shape == (n_dof, n_dof)
         assert D_y.shape == (n_dof, n_dof)
         assert G_y.shape == (n_dof,)
         assert tau_el_y.shape == (n_dof,)
+        assert tau_pot_y.shape == (n_dof,)
+        assert M_terms.shape == (n_dof, n_dof)
+        assert Cyd.shape == (n_dof,)
+        assert G_terms.shape == (n_dof,)

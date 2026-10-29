@@ -4,6 +4,7 @@ os.environ["JAX_PLATFORM_NAME"] = "cpu"
 
 from diffrax import Tsit5
 from functools import partial
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -11,8 +12,18 @@ import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 from diffrax import Tsit5
 
+from soromox.rendering.config import (
+    GeometryConfig,
+    GroundPlaneConfig,
+    RendererConfig,
+    SceneConfig,
+)
+
+VIDEO_OUTPUT = Path(__file__).resolve().parent / "videos" / f"{Path(__file__).stem}.mp4"
+
 jax.config.update("jax_enable_x64", True)  # double precision
 from soromox.rendering import (
+    ActuatorStyleConfig,
     BackboneColorConfig,
     MatplotlibRenderer,
     Open3DRenderer,
@@ -20,7 +31,8 @@ from soromox.rendering import (
     ViserRenderer,
     get_color_theme,
 )
-from soromox.systems import PCS, SystemState
+from soromox.systems import PCS, LinkSpec, SystemState
+from soromox.utils.geometry import poses
 
 jnp.set_printoptions(
     threshold=jnp.inf,
@@ -34,32 +46,30 @@ if __name__ == "__main__":
     rho = 1070 * jnp.ones(
         (num_segments,)
     )  # Volumetric density of Dragon Skin 20 [kg/m^3]
-    params = {
-        "p0": jnp.array(
-            [jnp.pi / 2, jnp.pi / 2, 0.0, 0.0, 0.0, 0.0]
-        ),  # Initial position and orientation
-        "L": 1e-1 * jnp.ones((num_segments,)),
-        "r": 2e-2 * jnp.ones((num_segments,)),
-        "rho": rho,
-        "g": jnp.array([0.0, 0.0, 9.81]),  # Gravity vector [m/s^2]
-        "E": 2e3 * jnp.ones((num_segments,)),  # Elastic modulus [Pa]
-        "G": 1e3 * jnp.ones((num_segments,)),  # Shear modulus [Pa]
-    }
-    params["D"] = 1e-3 * jnp.diag(
-        (
-            jnp.repeat(
-                jnp.array([[1e0, 1e0, 1e0, 1e3, 1e3, 1e3]]), num_segments, axis=0
+    segment_lengths = 1e-1 * jnp.ones((num_segments,))
+    material_damping_coefficient = 362.0
+    params = PCS.params_from_links(
+        [
+            LinkSpec.circular(
+                length=float(segment_lengths[index]),
+                radius=2e-2,
+                density=float(rho[index]),
+                young_modulus=2e3,
+                shear_modulus=1e3,
+                material_damping_coefficient=material_damping_coefficient,
+                reference_strain=[0, 0, 0, 1, 0, 0],
             )
-            * params["L"][:, None]
-        ).flatten()
+            for index in range(num_segments)
+        ],
+        gravity=jnp.array([0.0, 0.0, -9.81]),
     )
 
     # ======================================================
     # Robot initialization
     # ======================================================
     robot = PCS(
-        num_segments=num_segments,
         params=params,
+        base_pose=poses.spatial_mounting_pose("hanging"),
     )
 
     # =====================================================
@@ -159,7 +169,9 @@ if __name__ == "__main__":
     q_demo = q_ts[len(ts) // 2]
 
     # Color scheme demos (built-in palettes + themes)
-    demo_renderer = MatplotlibRenderer(robot, num_points=50)
+    demo_renderer = MatplotlibRenderer(
+        robot, config=RendererConfig(geometry=GeometryConfig(num_points=50))
+    )
     demo_renderer.show(
         q_demo,
         color_config=RendererColorConfig(
@@ -171,15 +183,28 @@ if __name__ == "__main__":
         q_demo,
         color_config=RendererColorConfig(
             backbone=BackboneColorConfig(point_palette="soromox:glacier"),
-            tendon_color=(0.2, 0.4, 0.8),
             base_plate_color=(0.15, 0.15, 0.15),
+            actuators=ActuatorStyleConfig(default_color=(0.2, 0.4, 0.8)),
         ),
     )
 
-    renderer = MatplotlibRenderer(robot, num_points=50)
+    renderer = MatplotlibRenderer(
+        robot, config=RendererConfig(geometry=GeometryConfig(num_points=50))
+    )
     renderer.animate(ts=ts, q_ts=q_ts, interval=100, mode="slider")
-    renderer = Open3DRenderer(robot, num_points=50)
-    renderer.render_sequence(ts, q_ts)
+    renderer = Open3DRenderer(
+        robot,
+        config=RendererConfig(
+            geometry=GeometryConfig(num_points=50),
+            scene=SceneConfig.technical(
+                ground=GroundPlaneConfig(
+                    surface=False, height_reference="base_mounting_face"
+                )
+            ),
+        ),
+    )
+    renderer.render_sequence(ts, q_ts, record_path=str(VIDEO_OUTPUT))
+    print(f"Saved {VIDEO_OUTPUT}")
 
     # =====================================================
     # Viser web-based visualization (opens in browser)
@@ -187,7 +212,17 @@ if __name__ == "__main__":
     # ViserRenderer provides interactive 3D visualization in the browser
     # with GUI controls for playback, speed, and looping.
     # Plotly plots are automatically added to the GUI at the end of the sidebar
-    viser_renderer = ViserRenderer(robot, num_points=50, backbone_style="discrete")
+    viser_renderer = ViserRenderer(
+        robot,
+        config=RendererConfig(
+            geometry=GeometryConfig(num_points=50),
+            scene=SceneConfig.technical(
+                ground=GroundPlaneConfig(
+                    surface=False, height_reference="base_mounting_face"
+                )
+            ),
+        ),
+    )
 
     # Create custom strain plots for PCS
     # Reshape to (T, num_segments, 6)

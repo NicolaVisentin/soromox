@@ -2,20 +2,25 @@
 
 This section covers continuum soft robots modeled using the Piecewise Constant Strain (PCS) approach based on discrete Cosserat rod theory.
 
+PCS uses the shared link, cross-section, and material model described in
+[Continuum Robot Components](../continuum-components.md). See
+[Parameters, Updates, and Optimization](../../../user-guide/parameters-and-optimization.md)
+for construction, replacement, and identification workflows.
+
 ## Overview
 
 PCS systems model continuum soft robots by dividing them into segments, each with constant strain. This approach provides:
 
 - Accurate continuum modeling with manageable complexity
 - Support for both 2D (planar) and 3D (spatial) robots
-- Various actuation methods (tendons, pneumatics)
+- Various actuation methods (tendons, pressure chambers)
 - Efficient numerical implementation using Gauss-Legendre quadrature
 
 ## Available Systems
 
 ### Base Implementations
 
-#### [PCS (Spatial)](pcs.md)
+#### [Spatial PCS](pcs.md)
 
 Core 3D PCS implementation for spatial continuum robots.
 
@@ -31,33 +36,22 @@ Core 3D PCS implementation for spatial continuum robots.
 - SE(2) kinematics with [theta, x, y] pose representation
 - Suitable for real-time applications
 
-### Tendon Actuated
+#### [Planar HSA](planar-hsa.md)
 
-#### [Tendon Actuated PCS](tendon-actuated-pcs.md)
+Specialized planar PCS soft robots with multiple physical rods per segment.
 
-3D PCS robots with active and passive tendon actuation.
+- HSA-specific rod, cap, and platform geometry
+- Optional motor-to-rod underactuation and Bouc--Wen hysteresis
+- JAX-native numerical kinematics and dynamics
 
-- Tendon routing with configurable paths
-- Active tendon tension control
-- Passive spring-damper tendons
+### Composable actuation
 
-#### [Tendon Actuated Planar PCS](tendon-actuated-planar-pcs.md)
+`PCS` and `PlanarPCS` accept actuator models through `actuators=`. Tendons,
+pushing rods, simplified muscles, and equivalent pressure chambers use the
+shared [threadlike actuation model](../../actuation/threadlike.md). Passive
+routed mechanics are installed separately with `ThreadlikeImpedance`.
 
-2D PCS robots with tendon actuation.
-
-- Cable-driven planar continuum robots
-- Configurable tendon distances from backbone
-- Segment-selective actuation
-
-### Pneumatic Actuated
-
-#### [Pneumatic Actuated Planar PCS](pneumatic-actuated-planar-pcs.md)
-
-2D PCS robots with pneumatic chamber actuation.
-
-- Pneumatic chamber modeling
-- Pressure-based control
-- Configurable chamber geometry
+### Pneumatic actuation
 
 #### [I-Support](isupport.md)
 
@@ -70,12 +64,10 @@ Core 3D PCS implementation for spatial continuum robots.
 
 | System | Dimension | Actuation | Use Case |
 |--------|-----------|-----------|----------|
-| `PCS` | 3D | None (strain input) | General 3D continuum modeling |
-| `PlanarPCS` | 2D | None (strain input) | General 2D continuum modeling |
-| `TendonActuatedPCS` | 3D | Tendons | 3D cable-driven robots |
-| `TendonActuatedPlanarPCS` | 2D | Tendons | 2D cable-driven robots |
-| `PneumaticActuatedPlanarPCS` | 2D | Pneumatic | Soft pneumatic actuators |
-| `ISupport` | 3D | Pneumatic | I-Support robot platform |
+| `PCS` | 3D | Identity or [composable](../../actuation/index.md) | General 3D continuum modeling |
+| `PlanarPCS` | 2D | Identity or [composable](../../actuation/index.md) | General 2D continuum modeling |
+| `PlanarHSA` | 2D | Motor or direct effort | Handed shearing auxetics robots |
+| `ISupport` | 3D | [Threadlike pneumatic](../../actuation/threadlike.md#modality-presets) | I-Support robot platform |
 
 ## References
 

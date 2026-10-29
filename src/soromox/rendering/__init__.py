@@ -5,13 +5,34 @@ This module provides various backends for visualizing robots:
 - MatplotlibRenderer: Generic renderer using Matplotlib (2D and 3D)
 - Open3DRenderer: Generic 3D renderer using Open3D
 - ViserRenderer: Web-based 3D renderer using Viser (interactive browser visualization)
+- ISupportViserRenderer: Viser renderer specialized for the pneumatic I-SUPPORT robot
+- UMArmViserRenderer: Viser renderer specialized for the McKibben-actuated UMArm
 - OpenCVPlanarHSARenderer: Specialized renderer for PlanarHSA robots
 - OpenCVPlanarRenderer: Generic renderer for planar robots
 """
 
+from soromox.rendering.actuation import actuator_visual_layers
+from soromox.rendering.actuators import (
+    ActuatorVisualLayer,
+    BatchedActuatorVisualLayer,
+    TrajectoryActuatorVisualLayer,
+)
 from soromox.rendering.base import BaseSoftRobotRenderer
-from soromox.rendering.camera_config import CameraConfig
-from soromox.rendering.color_config import (
+from soromox.rendering.config import (
+    AmbientLightConfig,
+    BackdropConfig,
+    DirectionalLightConfig,
+    GeometryConfig,
+    GroundPlaneConfig,
+    MaterialConfig,
+    PointLightConfig,
+    RendererConfig,
+    RenderOutputConfig,
+    SceneConfig,
+)
+from soromox.rendering.config.camera import CameraConfig
+from soromox.rendering.config.colors import (
+    ActuatorStyleConfig,
     BackboneColorConfig,
     ColorLegend,
     RendererColorConfig,
@@ -19,8 +40,19 @@ from soromox.rendering.color_config import (
     list_builtin_palettes,
     list_builtin_themes,
 )
+from soromox.rendering.config.output import VideoEncodingConfig
+from soromox.rendering.cross_sections import (
+    CrossSection,
+    CrossSectionSweepLayout,
+    DiscreteCrossSectionMarker,
+    cross_section_sweep_layout,
+    evaluate_cross_sections,
+    loft_cross_section_contours,
+    loft_cross_sections,
+    register_cross_section_contour,
+    sweep_cross_sections,
+)
 from soromox.rendering.matplotlib_renderer import MatplotlibRenderer
-from soromox.rendering.video_encoding import VideoEncodingConfig
 
 # Open3D renderer is optional (requires open3d package)
 try:
@@ -33,6 +65,31 @@ try:
     from soromox.rendering.viser_renderer import ViserRenderer
 except ImportError:
     ViserRenderer = None
+
+try:
+    from soromox.rendering.umarm import UMArmViserRenderer
+except ImportError:
+    UMArmViserRenderer = None
+
+try:
+    from soromox.rendering.isupport import (
+        ISupportViserRenderer,
+        ISupportVisualConfig,
+    )
+except ImportError:
+    ISupportViserRenderer = None
+    ISupportVisualConfig = None
+
+try:
+    from soromox.rendering.helicoidal import (
+        HelicoidalModuleVisual,
+        HelicoidalViserRenderer,
+        HelicoidalVisualConfig,
+    )
+except ImportError:
+    HelicoidalModuleVisual = None
+    HelicoidalViserRenderer = None
+    HelicoidalVisualConfig = None
 
 # Specialized OpenCV renderers are optional (require opencv-python)
 try:
@@ -50,6 +107,17 @@ __all__ = [
     "BaseSoftRobotRenderer",
     # Configuration
     "CameraConfig",
+    "RendererConfig",
+    "SceneConfig",
+    "GroundPlaneConfig",
+    "BackdropConfig",
+    "MaterialConfig",
+    "AmbientLightConfig",
+    "DirectionalLightConfig",
+    "PointLightConfig",
+    "GeometryConfig",
+    "RenderOutputConfig",
+    "ActuatorStyleConfig",
     "BackboneColorConfig",
     "RendererColorConfig",
     "ColorLegend",
@@ -57,10 +125,29 @@ __all__ = [
     "list_builtin_themes",
     "get_color_theme",
     "VideoEncodingConfig",
+    "CrossSection",
+    "CrossSectionSweepLayout",
+    "DiscreteCrossSectionMarker",
+    "cross_section_sweep_layout",
+    "evaluate_cross_sections",
+    "loft_cross_section_contours",
+    "loft_cross_sections",
+    "register_cross_section_contour",
+    "sweep_cross_sections",
+    "ActuatorVisualLayer",
+    "BatchedActuatorVisualLayer",
+    "TrajectoryActuatorVisualLayer",
+    "actuator_visual_layers",
     # Generic renderers
     "MatplotlibRenderer",
     "Open3DRenderer",
     "ViserRenderer",
+    "HelicoidalModuleVisual",
+    "HelicoidalViserRenderer",
+    "HelicoidalVisualConfig",
+    "ISupportViserRenderer",
+    "ISupportVisualConfig",
+    "UMArmViserRenderer",
     # Specialized renderers
     "OpenCVPlanarHSARenderer",
     "OpenCVPlanarRenderer",

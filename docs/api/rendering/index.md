@@ -2,20 +2,69 @@
 
 Visualization and rendering utilities for soft robot systems.
 
-## Overview
-
 The rendering module provides a class-based architecture for visualizing soft robots. All renderers inherit from a common base class `BaseSoftRobotRenderer` which provides cached forward kinematics and a unified interface.
 
-### Architecture
+## Core renderer gallery
 
-```text
-BaseSoftRobotRenderer (abstract base)
-├── MatplotlibRenderer         # Generic, works with any robot (2D/3D)
-├── Open3DRenderer             # Interactive 3D visualization
-├── ViserRenderer              # Web-based interactive 3D visualization
-├── OpenCVPlanarRenderer       # Fast 2D rendering
-└── OpenCVPlanarHSARenderer    # Specialized for PlanarHSA
-```
+The Matplotlib, Open3D, and Viser samples show the same upright tapered GVS
+tentacle with `SceneConfig.studio()` (the neutral studio variant), a pastel
+purple backbone and a dark base. OpenCV shows a two-link planar PCS counterpart
+with the same lengths and prescribed bending coordinates. Matplotlib uses a
+white background and its standard axes, ignoring scene appearance presets.
+OpenCV also uses a white background, with colored robot geometry and no scene
+lighting or ground scenery.
+
+The [preset gallery](presets.md) compares all six scene presets in Open3D and
+Viser. These examples select neutral studio explicitly; the renderer-wide default
+is the technical preset.
+
+<div class="grid cards soromox-gallery" markdown>
+
+-   **Matplotlib**
+
+    ![Spatial continuum robot rendered in three dimensions with Matplotlib](../../assets/rendering/matplotlib.png)
+
+    Polished static figures and notebook-friendly inspection for planar and
+    spatial robots.
+
+    [Matplotlib renderer details](renderers.md#matplotlib-renderer)
+
+-   **Open3D**
+
+    ![Spatial continuum robot rendered with Open3D](../../assets/rendering/open3d.png)
+
+    Interactive spatial inspection with geometry, camera control, and offline
+    frame or video capture.
+
+    [Open3D renderer details](renderers.md#open3d-renderer)
+
+-   **Viser**
+
+    ![Spatial continuum robot rendered in the Viser browser viewport](../../assets/rendering/viser.png)
+
+    Browser-based 3D visualization for live demos, playback, and multi-robot
+    scenes.
+
+    [Viser renderer details](renderers.md#viser-renderer)
+
+-   **OpenCV Planar**
+
+    ![Planar continuum robot frame rendered with OpenCV](../../assets/rendering/opencv-planar.png)
+
+    Lightweight real-time planar frames and fast video export.
+
+    [OpenCV Planar renderer details](renderers.md#opencv-planar-renderer)
+
+</div>
+
+Reproduce these images with `examples/rendering/backend_gallery.py --backend`
+followed by `matplotlib`, `open3d`, `viser` or `opencv`.
+
+System-specific renderer designs are documented alongside their robots: the
+[Planar HSA OpenCV renderer](../systems/pcs/planar-hsa.md#specialized-opencv-rendering),
+[I-Support Viser renderer](../systems/pcs/isupport.md#specialized-viser-rendering),
+[UMArm Viser renderer](../systems/articulated/mckibben-umarm.md), and
+[Helicoidal Viser renderer](../systems/gvs/helicoidal.md#specialized-viser-rendering).
 
 ## Choosing a Renderer
 
@@ -25,68 +74,45 @@ BaseSoftRobotRenderer (abstract base)
 | `Open3DRenderer` | Interactive 3D inspection | Rich camera controls, headless capture | Requires Open3D, 3D only |
 | `ViserRenderer` | Live demos, web-based visualization | Browser UI, live streaming, multi-robot | Requires web server, 3D only |
 | `OpenCVPlanarRenderer` | Fast 2D animations, video export | Lightweight, fast output | Planar robots only |
-| `OpenCVPlanarHSARenderer` | PlanarHSA-specific visuals | HSA-specific geometry | PlanarHSA only |
 
 ## Documentation
 
-### [Renderers](renderers.md)
+### [Renderer API](renderers.md)
 
-Complete API reference for all renderer classes:
+API reference for the shared base class and general-purpose backends:
 
 - `BaseSoftRobotRenderer` - Abstract base class
 - `MatplotlibRenderer` - Matplotlib-based visualization
 - `Open3DRenderer` - Open3D-based 3D visualization
 - `ViserRenderer` - Web-based visualization
 - `OpenCVPlanarRenderer` - OpenCV-based 2D visualization
-- `OpenCVPlanarHSARenderer` - HSA-specific visualization
 
-### [Camera & Colors](configuration.md)
+### [Shared Configuration](configuration.md)
 
-Configuration options for camera positioning and color schemes:
+Settings shared by multiple renderer backends:
 
+- `RendererConfig` - Scene, camera, colors, geometry and output settings
+- Scene presets, physical light units and backend approximations
 - `CameraConfig` - Camera positioning and field of view
+- Robot base, base-plate, and ground-plane behavior
+- Multi-robot layouts and spacing
+- Recording and video encoding
 - `RendererColorConfig` - Color configuration hierarchy
 - `BackboneColorConfig` - Backbone-specific colors
 - Built-in color palettes and themes
 
 ## Quick Start
 
-=== "Matplotlib (any robot)"
+All renderers accept a robot model at construction and expose a single-frame
+entry point. For example:
 
-    ```python
-    from soromox.rendering import MatplotlibRenderer
+```python
+from soromox.rendering import RendererConfig, GeometryConfig, MatplotlibRenderer
 
-    renderer = MatplotlibRenderer(robot, num_points=50)
-    renderer.show(q)  # Single frame
-    renderer.animate(ts, q_ts, mode="slider")  # Interactive
-    ```
+renderer = MatplotlibRenderer(robot, config=RendererConfig(geometry=GeometryConfig(num_points=50)))
+renderer.show(q)
+```
 
-=== "Open3D (3D robots)"
-
-    ```python
-    from soromox.rendering import Open3DRenderer
-
-    renderer = Open3DRenderer(robot, num_points=80)
-    renderer.show(q)  # Interactive viewer
-    renderer.render_sequence(ts, q_ts, record_path="video.mp4")
-    ```
-
-=== "Viser (web-based)"
-
-    ```python
-    from soromox.rendering import ViserRenderer
-
-    renderer = ViserRenderer(robot, port=8080)
-    renderer.show(q)  # Opens browser
-    renderer.render_sequence(ts, q_ts, loop=True)
-    ```
-
-=== "OpenCV (planar)"
-
-    ```python
-    from soromox.rendering import OpenCVPlanarRenderer
-
-    renderer = OpenCVPlanarRenderer(robot, width=800, height=600)
-    img = renderer.render_frame(q)
-    renderer.render_sequence(ts, q_ts, record_path="video.mp4")
-    ```
+Choose another backend from the table above, then follow its
+[API reference](renderers.md) for interactive playback, live mode, or video
+capture.

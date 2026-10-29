@@ -1,3 +1,31 @@
-from .core import *
-from .specs import *
-from .tendon_actuated_gvs import *
+from soromox.systems.gvs.params import (
+    GVSParams,
+    HelicoidalBackboneParams,
+    HelicoidalHelixParams,
+)
+from soromox.systems.gvs.structures import (
+    GVSJointStructure,
+    GVSLinkStructure,
+    GVSSegmentStructure,
+    GVSStrainBasisStructure,
+    GVSStructure,
+)
+
+from .core import GVS
+from .helicoidal import Helicoidal
+from .specs import GVSSegment, StrainBasisSpec
+
+__all__ = [
+    "GVS",
+    "GVSSegment",
+    "StrainBasisSpec",
+    "GVSParams",
+    "GVSStructure",
+    "GVSSegmentStructure",
+    "GVSLinkStructure",
+    "GVSJointStructure",
+    "GVSStrainBasisStructure",
+    "Helicoidal",
+    "HelicoidalBackboneParams",
+    "HelicoidalHelixParams",
+]

@@ -6,11 +6,11 @@ This page provides an overview of the main components and modules in the SoRoMoX
 
 SoRoMoX is a comprehensive library for modeling, simulating, and controlling soft robots using JAX. The package is organized into several main components:
 
-- **[Systems](systems/index.md)**: Robot system implementations (articulated soft robots, pendulums, PCS, GVS, HSA)
+- **[Systems](systems/index.md)**: Robot system implementations (articulated soft robots, pendulums, PCS, and GVS)
 - **[Control](control/index.md)**: Model-based controllers for trajectory tracking and regulation
 - **[Rendering](rendering/index.md)**: Visualization and animation utilities
-- **[Actuation](actuation.md)**: Actuation modeling and utilities
-- **[Utilities](utilities/index.md)**: Parameter management and symbolic derivation tools
+- **[Actuation](actuation/index.md)**: Actuation modeling and utilities
+- **[Utilities](utilities/index.md)**: Parameter management, numerical, geometry, and Lie algebra tools
 
 ---
 
@@ -21,13 +21,12 @@ The [Systems](systems/index.md) module contains implementations for various robo
 - Forward kinematics and Jacobians
 - Dynamics (mass matrices, Coriolis forces, gravitational effects)
 - Energy computation methods
-- Support for various actuation methods (direct torque, tendons, pneumatics)
+- Support for various actuation methods (direct torque, tendons, pressure chambers)
 
-SoRoMoX includes four main system categories:
+SoRoMoX includes three main system categories:
 - **Articulated Systems**: Planar pendulums, tendon-actuated pendulums, and spatial articulated soft robots
-- **PCS Systems**: Piecewise Constant Strain continuum robots (2D & 3D)
+- **PCS Systems**: Piecewise Constant Strain continuum robots (2D & 3D), including the 2D PlanarHSA variant
 - **GVS Systems**: Geometric Variable Strain robots (3D)
-- **HSA Systems**: Handed Shearing Auxetics robots (2D)
 
 ---
 
@@ -59,7 +58,7 @@ All renderers inherit from a common base class and provide cached forward kinema
 
 ## Actuation
 
-The [Actuation](actuation.md) module provides utilities for modeling and working with different actuation methods, including tendon routing, pneumatic chambers, and direct torque actuation.
+The [Actuation](actuation/index.md) module provides utilities for modeling and working with different actuation methods, including tendon routing, pressure chambers, and direct torque actuation.
 
 ---
 
@@ -68,7 +67,11 @@ The [Actuation](actuation.md) module provides utilities for modeling and working
 The [Utilities](utilities/index.md) module includes:
 
 - **[Parameters](utilities/parameters.md)**: Parameter handling, validation, and default configurations for soft robot systems
-- **[Symbolic Derivation](utilities/symbolic-derivation.md)**: Symbolic mathematics and derivation utilities using SymPy for soft robot modeling
+- **[Numerics](utilities/numerics.md)**: Finite singular-point conventions for common JAX operations
+- **[Geometry](utilities/geometry.md)**: Pose encodings, rotations, and geometric errors
+- **[Lie Algebra](utilities/lie-algebra.md)**: Rigid-body maps and stable Jacobian coefficients
+- **[Constant Strain](utilities/constant-strain.md)**: Planar and spatial rod-segment operators
+- **[Numerical Jacobian](utilities/numerical-jacobian.md)**: Bound-aware finite-difference gradients and Jacobians
 
 ---
 

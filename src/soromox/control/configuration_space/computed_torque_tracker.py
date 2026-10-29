@@ -1,7 +1,7 @@
 __all__ = ["ComputedTorqueTracker"]
 
 import warnings
-from typing import Any, Optional, Tuple
+from typing import Any
 
 import jax.numpy as jnp
 from jax import Array
@@ -99,8 +99,7 @@ class ComputedTorqueTracker(ClosedFormModelBasedController):
 
         Args:
             robot: The soft robot system to be controlled.
-                Must have `actuation_matrix(q)`, `inertia_matrix(q)`,
-                `coriolis_matrix(q, qd)`, `gravitational_force(q)`,
+                Must have `actuation_matrix(q)`, `dynamics_terms(q, qd)`,
                 `elastic_force(q)`, and `damping_matrix(q)` methods.
             reference_trajectory: The desired trajectory to track.
                 Must provide x_des_fn (desired configuration), xd_des_fn
@@ -145,14 +144,13 @@ class ComputedTorqueTracker(ClosedFormModelBasedController):
                 f"Pustina (2022), Della Santina (2023), and Pustina (2025)."
             )
 
-        if scenario == ActuationScenario.FULL_ACTUATION:
-            if rank < n_dof:
-                raise ValueError(
-                    f"ComputedTorqueTracker requires an invertible actuation matrix, but "
-                    f"the actuation matrix is singular (rank {rank} < {n_dof}). "
-                    f"The actuation matrix must be full rank (positive-definite) for "
-                    f"computed torque control."
-                )
+        if scenario == ActuationScenario.FULL_ACTUATION and rank < n_dof:
+            raise ValueError(
+                f"ComputedTorqueTracker requires an invertible actuation matrix, but "
+                f"the actuation matrix is singular (rank {rank} < {n_dof}). "
+                f"The actuation matrix must be full rank (positive-definite) for "
+                f"computed torque control."
+            )
 
         if scenario == ActuationScenario.OVERACTUATION:
             if rank < n_dof:
@@ -175,9 +173,7 @@ class ComputedTorqueTracker(ClosedFormModelBasedController):
 
         return scenario
 
-    def model_based_term(
-        self, system_state: SystemState
-    ) -> Tuple[Array, Optional[Any]]:
+    def model_based_term(self, system_state: SystemState) -> tuple[Array, Any | None]:
         """
         Compute the model-based feedforward control term for computed torque control.
 
@@ -198,25 +194,24 @@ class ComputedTorqueTracker(ClosedFormModelBasedController):
         y = system_state.y
 
         # Get current configuration and velocity
-        q, qd = jnp.split(y, 2)
+        robot, q, qd = self._controller_robot_and_state(y)
 
         # Get desired trajectory at current time
         assert self.reference_trajectory.xdd_des_fn is not None
         qdd_des = self.reference_trajectory.xdd_des_fn(t)
 
-        # Compute dynamics matrices at current configuration and velocity
-        M = self.robot.inertia_matrix(q)
-        C = self.robot.coriolis_matrix(q, qd)
-        G = self.robot.gravitational_force(q)
-        tau_el = self.robot.elastic_force(q)
-        D = self.robot.damping_matrix(q)
+        # Compute the coupled dynamics terms at the current state. The returned
+        # Coriolis term is already contracted with the supplied velocity.
+        M, Cqd, G = robot.dynamics_terms(q, qd)
+        tau_el = robot.elastic_force(q)
+        D = robot.damping_matrix(q)
 
         # Compute the inverse dynamics: cancel all forces and apply desired acceleration
         # tau = M(q) @ qdd_des + C(q, qd) @ qd + G(q) + tau_el(q) + D(q) @ qd
-        tau_model = M @ qdd_des + C @ qd + G + tau_el + D @ qd
+        tau_model = M @ qdd_des + Cqd + G + tau_el + D @ qd
 
         # Get the actuation matrix at current configuration
-        A = self.robot.actuation_matrix(q)
+        A = robot.actuation_matrix(q)
 
         # Compute actuator input using inverse (or pseudo-inverse for overactuation)
         if self._actuation_scenario == ActuationScenario.OVERACTUATION:
@@ -228,7 +223,7 @@ class ComputedTorqueTracker(ClosedFormModelBasedController):
 
     def error_based_feedback_term(
         self, system_state: SystemState
-    ) -> Tuple[Array, Optional[PIDControllerState]]:
+    ) -> tuple[Array, PIDControllerState | None]:
         """
         Compute the PID-based feedback control term for computed torque control.
 
@@ -258,7 +253,7 @@ class ComputedTorqueTracker(ClosedFormModelBasedController):
         y = system_state.y
 
         # Split state into configuration and velocity
-        q, qd = jnp.split(y, 2)
+        robot, q, qd = self._controller_robot_and_state(y)
 
         # Get reference trajectory at current time
         assert self.reference_trajectory.x_des_fn is not None
@@ -271,7 +266,7 @@ class ComputedTorqueTracker(ClosedFormModelBasedController):
         ed = qd_des - qd  # Velocity error
 
         # Get integral error from control state (or zeros if not tracking)
-        control_state: Optional[PIDControllerState] = system_state.control_state
+        control_state: PIDControllerState | None = system_state.control_state
         if control_state is None:
             integral_error = jnp.zeros_like(q)
         else:
@@ -281,13 +276,13 @@ class ComputedTorqueTracker(ClosedFormModelBasedController):
         qdd_fb, integral_error_dot = self.pid_control(e, ed, integral_error)
 
         # Get inertia matrix at current configuration
-        M = self.robot.inertia_matrix(q)
+        M = robot.inertia_matrix(q)
 
         # Compute feedback torque: tau_fb = M(q) @ qdd_fb
         tau_fb = M @ qdd_fb
 
         # Get the actuation matrix and compute actuator input
-        A = self.robot.actuation_matrix(q)
+        A = robot.actuation_matrix(q)
         if self._actuation_scenario == ActuationScenario.OVERACTUATION:
             u_feedback = jnp.linalg.pinv(A) @ tau_fb
         else:
@@ -300,4 +295,3 @@ class ComputedTorqueTracker(ClosedFormModelBasedController):
             control_state_dot = None
 
         return u_feedback, control_state_dot
-

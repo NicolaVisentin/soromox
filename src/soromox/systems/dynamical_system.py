@@ -2,7 +2,7 @@ __all__ = ["DynamicalSystem"]
 import math
 import warnings
 from abc import abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -40,11 +40,12 @@ class _RolloutState:
     @classmethod
     def tree_unflatten(cls, aux, children):
         y, control_state, environment_state = children
-        return cls(y=y, control_state=control_state, environment_state=environment_state)
+        return cls(
+            y=y, control_state=control_state, environment_state=environment_state
+        )
 
 
 class DynamicalSystem(eqx.Module):
-    num_dofs: int = eqx.field(static=True)  # Number of degrees of freedom
     num_actuators: int = eqx.field(static=True)  # Number of actuators
 
     @abstractmethod
@@ -54,12 +55,13 @@ class DynamicalSystem(eqx.Module):
         """
         Compute the forward dynamics of the system.
 
-        This method computes the state derivative yd = [qd, qdd] given the
-        current time, state, and actuation inputs.
+        This method computes the state derivative ``yd`` given the current
+        time, state, and actuation inputs. No particular decomposition or order
+        of the state is assumed.
 
         Args:
             t (Array): Current time.
-            y (Array): State vector containing configuration and velocity.
+            y (Array): State vector.
             actuation_args (Optional[Tuple]): Tuple of actuation inputs, typically (u, tau_ext) where
                 u is the control input and tau_ext is the external force/torque.
 
@@ -74,18 +76,24 @@ class DynamicalSystem(eqx.Module):
         t1: float | Array,
         solver_dt: float | Array,
         save_dt: float | Array | None,
-        save_ts: Array | None = None,
+        save_ts: Array | Sequence[float] | None = None,
     ) -> Array:
         """Build the array of time stamps to save during integration."""
         if save_ts is not None:
-            return save_ts
+            return jnp.asarray(save_ts)
 
         assert save_dt is not None, "Either save_ts or save_dt must be provided."
         assert save_dt > 0.0, "save_dt must be positive."
         assert save_dt >= solver_dt, (
             "save_dt must be greater than or equal to the solver step size."
         )
-        return jnp.arange(t0, t1 + save_dt, save_dt)
+        assert t1 >= t0, "t1 must be greater than or equal to t0."
+
+        # Stopping at (rather than beyond) t1 ensures that round-off cannot
+        # produce an invalid save time after the integration interval. Append
+        # t1 explicitly so the final requested time is represented exactly.
+        save_times = jnp.arange(t0, t1, save_dt)
+        return jnp.concatenate([save_times, jnp.atleast_1d(t1)])
 
     @staticmethod
     def _zero_like_pytree(state: Any | None) -> Any | None:
@@ -110,6 +118,21 @@ class DynamicalSystem(eqx.Module):
             return tau_environment
         return base_tau_ext + tau_environment
 
+    def project_state(self, y: Array) -> Array:
+        """Project state storage onto the system state manifold.
+
+        The generic implementation is an identity operation. Systems with a
+        constrained state representation can override this hook. It is invoked
+        before rollout callbacks and on saved trajectories.
+
+        Args:
+            y: System state with the state dimension on the trailing axis.
+
+        Returns:
+            Projected state with the same shape as ``y``.
+        """
+        return y
+
     def _open_loop_forward_dynamics(
         self, t: Array, ode_state: _RolloutState, actuation_args
     ) -> _RolloutState:
@@ -118,6 +141,7 @@ class DynamicalSystem(eqx.Module):
         This is defined as a class method rather than an inline closure to avoid
         JAX/XLA compilation overhead associated with closures.
         """
+        y = self.project_state(ode_state.y)
         (
             base_u_val,
             base_tau_ext,
@@ -131,7 +155,7 @@ class DynamicalSystem(eqx.Module):
         if environment_model is not None:
             system_state = SystemState(
                 t=t,
-                y=ode_state.y,
+                y=y,
                 u=base_u_val,
                 control_state=None,
                 environment_state=ode_state.environment_state,
@@ -147,10 +171,8 @@ class DynamicalSystem(eqx.Module):
                 else zero_environment_state_dot
             )
 
-        tau_ext_total = self._combine_external_torques(
-            base_tau_ext, tau_environment
-        )
-        yd = self.forward_dynamics(t, ode_state.y, (base_u_val, tau_ext_total))
+        tau_ext_total = self._combine_external_torques(base_tau_ext, tau_environment)
+        yd = self.forward_dynamics(t, y, (base_u_val, tau_ext_total))
         return _RolloutState(
             y=yd,
             environment_state=environment_state_dot
@@ -198,9 +220,10 @@ class DynamicalSystem(eqx.Module):
         track_control_state = zero_control_state_dot is not None
         track_environment_state = zero_environment_state_dot is not None
 
+        y = self.project_state(ode_state.y)
         system_state = SystemState(
             t=t,
-            y=ode_state.y,
+            y=y,
             u=base_u_val,
             control_state=ode_state.control_state,
             environment_state=ode_state.environment_state,
@@ -217,7 +240,7 @@ class DynamicalSystem(eqx.Module):
         if environment_model is not None:
             environment_system_state = SystemState(
                 t=t,
-                y=ode_state.y,
+                y=y,
                 u=u_total,
                 control_state=ode_state.control_state,
                 environment_state=ode_state.environment_state,
@@ -235,10 +258,8 @@ class DynamicalSystem(eqx.Module):
                 else zero_environment_state_dot
             )
 
-        tau_ext_total = self._combine_external_torques(
-            base_tau_ext, tau_environment
-        )
-        yd = self.forward_dynamics(t, ode_state.y, (u_total, tau_ext_total))
+        tau_ext_total = self._combine_external_torques(base_tau_ext, tau_environment)
+        yd = self.forward_dynamics(t, y, (u_total, tau_ext_total))
         if track_control_state:
             control_state_dot = (
                 control_state_dot
@@ -263,7 +284,7 @@ class DynamicalSystem(eqx.Module):
         t1: float | Array = 10.0,
         solver_dt: float | Array = 1e-4,
         save_dt: float | Array | None = 0.01,
-        save_ts: Array | None = None,
+        save_ts: Array | Sequence[float] | None = None,
         solver: AbstractSolver | None = None,
         stepsize_controller: AbstractStepSizeController | None = ConstantStepSize(),
         max_steps: int | None = None,
@@ -307,7 +328,7 @@ class DynamicalSystem(eqx.Module):
         if base_u is None:
             base_u = jnp.zeros((self.num_actuators,))
 
-        y0 = initial_state.y  # initial state vector
+        y0 = self.project_state(initial_state.y)
         environment_state0 = initial_state.environment_state
         zero_environment_state_dot = self._zero_like_pytree(environment_state0)
 
@@ -361,7 +382,7 @@ class DynamicalSystem(eqx.Module):
         )
 
         ts = sol.ts
-        y_ts = sol.ys.y
+        y_ts = self.project_state(sol.ys.y)
         environment_state_out = sol.ys.environment_state
 
         us = jnp.broadcast_to(base_u, (ts.shape[0], base_u.shape[0]))
@@ -383,8 +404,8 @@ class DynamicalSystem(eqx.Module):
         | None = None,
         t1: float | Array = 10.0,
         solver_dt: float | Array = 1e-4,
-        save_dt: float | Array = 0.01,
-        save_ts: Array | None = None,
+        save_dt: float | Array | None = 0.01,
+        save_ts: Array | Sequence[float] | None = None,
         solver: AbstractSolver | None = None,
         stepsize_controller: AbstractStepSizeController | None = ConstantStepSize(),
         max_steps: int | None = None,
@@ -430,7 +451,7 @@ class DynamicalSystem(eqx.Module):
         if base_u is None:
             base_u = jnp.zeros((self.num_actuators,))
 
-        y0 = initial_state.y
+        y0 = self.project_state(initial_state.y)
 
         controller_state0 = initial_state.control_state
         track_control_state = controller_state0 is not None
@@ -477,7 +498,7 @@ class DynamicalSystem(eqx.Module):
         )
 
         ts = sol.ts
-        y_ts = sol.ys.y
+        y_ts = self.project_state(sol.ys.y)
         controller_state_out = sol.ys.control_state
         environment_state_out = sol.ys.environment_state
 
@@ -647,7 +668,7 @@ class DynamicalSystem(eqx.Module):
             base_u = jnp.zeros((self.num_actuators,))
 
         rollout_state = _RolloutState(
-            y=initial_state.y,
+            y=self.project_state(initial_state.y),
             control_state=initial_state.control_state,
             environment_state=initial_state.environment_state,
         )
@@ -685,7 +706,11 @@ class DynamicalSystem(eqx.Module):
                 next_carry: next rollout state.
                 outputs: tuple of saved times, states, actuations, control states, and environment states.
             """
-            state_in = carry
+            state_in = _RolloutState(
+                y=self.project_state(carry.y),
+                control_state=carry.control_state,
+                environment_state=carry.environment_state,
+            )
             t_start, t_end = t_bounds
 
             system_state = SystemState(
@@ -735,7 +760,7 @@ class DynamicalSystem(eqx.Module):
                 stepsize_controller=stepsize_controller,
                 max_steps=max_steps,
             )
-            y_out = sol.ys.y
+            y_out = self.project_state(sol.ys.y)
             environment_state_out = sol.ys.environment_state
 
             ctrl_state_next = (
@@ -756,7 +781,8 @@ class DynamicalSystem(eqx.Module):
                     lambda c, c_next: jnp.concatenate(
                         [
                             jnp.broadcast_to(
-                                c, (sol.ts.shape[0] - 1,) + c.shape  # type: ignore[misc]
+                                c,
+                                (sol.ts.shape[0] - 1,) + c.shape,  # type: ignore[misc]
                             ),
                             c_next[None, ...],
                         ],

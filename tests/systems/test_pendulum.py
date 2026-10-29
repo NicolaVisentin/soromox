@@ -1,3 +1,5 @@
+# ruff: noqa: E402
+import equinox as eqx
 import jax
 
 jax.config.update("jax_enable_x64", True)  # double precision
@@ -5,7 +7,10 @@ import jax.numpy as jnp
 import numpy as onp
 import pytest
 from numpy.testing import assert_allclose
+from system_param_builders import pendulum_params, planar_base_pose
 
+from soromox.actuation import ArticulatedTendonActuator
+from soromox.autodiff import custom_jvp_mode
 from soromox.systems import Pendulum
 from soromox.utils.tolerance import Tolerance
 
@@ -15,23 +20,177 @@ def make_pendulum(N: int = 2):
     assert N in (2, 3)
     if N == 2:
         m = jnp.array([1.0, 2.0])
-        I = jnp.array([0.1, 0.2])
+        inertia = jnp.array([0.1, 0.2])
         L = jnp.array([1.0, 1.5])
         Lc = jnp.array([0.5, 0.75])
     else:  # N == 3
         m = jnp.array([1.0, 2.0, 0.8])
-        I = jnp.array([0.1, 0.2, 0.05])
+        inertia = jnp.array([0.1, 0.2, 0.05])
         L = jnp.array([1.0, 1.5, 0.8])
         Lc = jnp.array([0.5, 0.75, 0.4])
 
-    params = {
-        "m": m,
-        "I": I,
-        "L": L,
-        "Lc": Lc,
-        "g": jnp.array([0.0, -9.81]),
+    params = pendulum_params(
+        mass=m,
+        moment_inertia=inertia,
+        length=L,
+        center_of_mass_length=Lc,
+        gravity=jnp.array([0.0, -9.81]),
+    )
+    return Pendulum(params, base_pose=planar_base_pose())
+
+
+def _parameter_summary(model):
+    return jnp.concatenate(
+        [model.fixed_base_pose, model.g, model.m, model.K.reshape(-1)]
+    )
+
+
+def test_parameter_updates_refresh_eager_runtime_arrays_immutably():
+    robot = make_pendulum(2)
+    params = robot.params
+    updated_params = params.replace(
+        gravity=params.gravity.at[1].set(-9.7),
+        mass=params.mass + 0.1,
+        joint_stiffness=params.joint_stiffness + 0.2 * jnp.eye(2),
+    )
+    before = _parameter_summary(robot)
+
+    updated = robot.with_params(updated_params)
+
+    assert_allclose(_parameter_summary(robot), before)
+    assert not jnp.allclose(_parameter_summary(updated), before)
+
+
+def test_same_structure_parameter_updates_compile_once():
+    robot = make_pendulum(2)
+    params = robot.params
+    updated_params = params.replace(
+        gravity=params.gravity.at[1].set(-9.7),
+        mass=params.mass + 0.1,
+        joint_stiffness=params.joint_stiffness + 0.2 * jnp.eye(2),
+    )
+    trace_count = {"value": 0}
+
+    @eqx.filter_jit
+    def compiled_summary(current_params):
+        trace_count["value"] += 1
+        return _parameter_summary(robot.with_params(current_params))
+
+    baseline = compiled_summary(params)
+    actual = compiled_summary(updated_params)
+
+    assert trace_count["value"] == 1
+    assert not jnp.allclose(actual, baseline)
+    assert_allclose(actual, _parameter_summary(robot.with_params(updated_params)))
+
+
+def test_grad_differentiates_through_typed_params():
+    robot = make_pendulum(2)
+    params = robot.params
+    q = jnp.array([0.25, -0.15], dtype=jnp.float64)
+
+    def energy_for_first_mass(mass_0):
+        current = params.replace(mass=params.mass.at[0].set(mass_0))
+        return robot.with_params(current).potential_energy(q)
+
+    grad_value = jax.grad(energy_for_first_mass)(params.mass[0])
+    assert jnp.isfinite(grad_value)
+
+
+def test_compiled_gravity_energy_gradients_do_not_retrace():
+    robot = make_pendulum(2)
+    params = robot.params
+    q = jnp.array([0.25, -0.15], dtype=jnp.float64)
+    updated_gravity = params.gravity.at[1].set(-9.7)
+    trace_count = {"value": 0}
+
+    @eqx.filter_jit
+    def compiled_value_and_grad(gravity):
+        trace_count["value"] += 1
+
+        def energy(current_gravity):
+            candidate = robot.with_params(params.replace(gravity=current_gravity))
+            return candidate.gravitational_energy(q)
+
+        return jax.value_and_grad(energy)(gravity)
+
+    def reference_value_and_grad(gravity):
+        def energy(current_gravity):
+            candidate = robot.with_params(params.replace(gravity=current_gravity))
+            return candidate._gravitational_energy(q)
+
+        return jax.value_and_grad(energy)(gravity)
+
+    with custom_jvp_mode(True):
+        baseline = compiled_value_and_grad(params.gravity)
+        updated = compiled_value_and_grad(updated_gravity)
+
+    expected_baseline = reference_value_and_grad(params.gravity)
+    expected_updated = reference_value_and_grad(updated_gravity)
+
+    assert trace_count["value"] == 1
+    assert not jnp.allclose(updated[0], baseline[0])
+    for actual, expected in zip(baseline, expected_baseline, strict=True):
+        assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+    for actual, expected in zip(updated, expected_updated, strict=True):
+        assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+    assert jnp.isfinite(baseline[1]).all()
+    assert jnp.any(baseline[1] != 0.0)
+
+
+def test_pendulum_update_rejects_all_fixed_size_shape_changes():
+    robot = make_pendulum(2)
+
+    invalid_updates = {
+        "length": jnp.ones((3,)),
+        "moment_inertia": jnp.ones((3,)),
+        "center_of_mass_length": jnp.ones((3,)),
+        "joint_stiffness": jnp.eye(3),
+        "joint_damping": jnp.eye(3),
+        "joint_rest_configuration": jnp.ones((3,)),
+        "radius": jnp.ones((3,)),
+        "gravity": jnp.ones((3,)),
     }
-    return Pendulum(params)
+
+    for name, value in invalid_updates.items():
+        with pytest.raises(ValueError, match=name):
+            robot.update_params(**{name: value})
+
+
+def test_tendon_pendulum_update_reapplies_routing_invariants():
+    body = pendulum_params(
+        mass=jnp.ones((3,)),
+        moment_inertia=0.1 * jnp.ones((3,)),
+        length=jnp.ones((3,)),
+        center_of_mass_length=0.5 * jnp.ones((3,)),
+        gravity=jnp.array([0.0, -9.81]),
+    )
+    actuator = ArticulatedTendonActuator.from_routing(jnp.tril(jnp.ones((3, 3))))
+    robot = Pendulum(body, actuators=actuator)
+
+    rank_deficient = actuator.params.transmission.replace(
+        routing_matrix=jnp.array(
+            [
+                [1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 1.0],
+            ]
+        )
+    )
+    with pytest.raises(ValueError, match="full row rank"):
+        robot.update_actuator_params(0, transmission=rank_deficient)
+
+    joint_skipping = actuator.params.transmission.replace(
+        routing_matrix=jnp.array(
+            [
+                [1.0, 0.0, 1.0],
+                [1.0, 1.0, 0.0],
+                [1.0, 1.0, 1.0],
+            ]
+        )
+    )
+    with pytest.raises(ValueError, match="skip joints"):
+        robot.update_actuator_params(0, transmission=joint_skipping)
 
 
 @pytest.mark.parametrize("N", [2, 3])
@@ -70,7 +229,10 @@ def test_jacobian_match_autodiff(N):
     J_tips_impl = robot.jacobian_tips(q)  # (N,3,N)
     # Autodiff jacobian for each link's [theta, px, py]
     for i in range(robot.num_links):
-        f_tip_i = lambda q_: robot.forward_kinematics_tips(q_)[i]
+
+        def f_tip_i(q_, link_index=i):
+            return robot.forward_kinematics_tips(q_)[link_index]
+
         J_ad_i = jax.jacfwd(f_tip_i)(q)
         assert_allclose(
             J_tips_impl[i],
@@ -82,7 +244,10 @@ def test_jacobian_match_autodiff(N):
     # COMs
     J_coms_impl = robot.jacobian_coms(q)
     for i in range(robot.num_links):
-        f_com_i = lambda q_: robot.forward_kinematics_coms(q_)[i]
+
+        def f_com_i(q_, link_index=i):
+            return robot.forward_kinematics_coms(q_)[link_index]
+
         J_ad_i = jax.jacfwd(f_com_i)(q)
         assert_allclose(
             J_coms_impl[i],
@@ -94,7 +259,10 @@ def test_jacobian_match_autodiff(N):
     # Joints
     J_joints_impl = robot.jacobian_joints(q)
     for i in range(robot.num_links):
-        f_joint_i = lambda q_: robot.forward_kinematics_joints(q_)[i]
+
+        def f_joint_i(q_, link_index=i):
+            return robot.forward_kinematics_joints(q_)[link_index]
+
         J_ad_i = jax.jacfwd(f_joint_i)(q)
         assert_allclose(
             J_joints_impl[i],
@@ -105,13 +273,13 @@ def test_jacobian_match_autodiff(N):
 
 
 @pytest.mark.parametrize("N", [2, 3])
-def test_jacobian_time_derivative_matches_jvp(N):
+def test_tip_jacobian_time_derivative_matches_jvp(N):
     robot = make_pendulum(N)
     q = jnp.linspace(-0.3, 0.4, N)
     qd = jnp.linspace(0.6, -0.5, N)
 
     # Closed-form J and Jdot at tips
-    J_closed, Jd_closed = robot.jacobian_and_derivatives_tips(q, qd)
+    J_closed, Jd_closed = robot.jacobian_and_time_derivatives_tips(q, qd)
 
     # Jdot via directional derivative with JAX JVP
     def J_of_q(q_):
@@ -135,13 +303,13 @@ def test_tip_jacobian_time_derivative_autodiff_contraction(N):
     qd = jnp.linspace(0.7, -0.4, N)
 
     J_tips = robot.jacobian_tips(q)
-    J_tips_closed, Jd_tips_closed = robot.jacobian_and_derivatives_tips(q, qd)
+    J_tips_closed, Jd_tips_closed = robot.jacobian_and_time_derivatives_tips(q, qd)
 
     # dJ/dq via autodiff, then Jdot = (dJ/dq) · qd
     dJdq_tips = jax.jacrev(robot.jacobian_tips)(q)  # (N,3,N,N)
     Jd_tips_auto = jnp.einsum("ijkl,l->ijk", dJdq_tips, qd)
 
-    # J returned by jacobian_and_derivatives_tips matches jacobian_tips
+    # J returned by jacobian_and_time_derivatives_tips matches jacobian_tips
     assert_allclose(
         J_tips,
         J_tips_closed,
@@ -168,7 +336,7 @@ def test_inertia_matrix_at_zero_config_matches_closed_form(N):
     L = onp.array(robot.L, dtype=float)
     Lc = onp.array(robot.Lc, dtype=float)
     m = onp.array(robot.m, dtype=float)
-    I = onp.array(robot.I, dtype=float)
+    inertia = onp.array(robot.I, dtype=float)
 
     # x-positions of joints and COMs
     p_joint_x = onp.concatenate([[0.0], onp.cumsum(L)[:-1]])  # (N,)
@@ -185,7 +353,7 @@ def test_inertia_matrix_at_zero_config_matches_closed_form(N):
     # Angular part via planar Jw (lower-triangular ones per row)
     idx = onp.arange(N)
     Jw = (idx[None, :] <= idx[:, None]).astype(float)  # (N,N)
-    W_ang = onp.einsum("i,ia,ib->ab", I, Jw, Jw)
+    W_ang = onp.einsum("i,ia,ib->ab", inertia, Jw, Jw)
 
     B_expected = M_lin + W_ang
     assert_allclose(B, B_expected, rtol=Tolerance.rtol(), atol=Tolerance.atol())
@@ -227,13 +395,29 @@ def test_gravity_matches_potential_gradient(N):
     assert_allclose(G, dU_dq, rtol=Tolerance.rtol(), atol=Tolerance.atol())
 
 
+def test_rotated_fixed_base_gravity_matches_raw_potential_gradient() -> None:
+    robot = make_pendulum(3).with_fixed_base_pose(jnp.array([0.73, 0.03, -0.02]))
+    q = jnp.array([-0.25, 0.1, 0.5])
+
+    dU_dq = jax.grad(robot._gravitational_energy)(q)
+
+    assert_allclose(
+        dU_dq,
+        robot.gravitational_force(q),
+        rtol=Tolerance.rtol(),
+        atol=Tolerance.atol(),
+    )
+
+
 @pytest.mark.parametrize("N", [2, 3])
 def test_forward_dynamics_rest_with_zero_forces(N):
     robot = make_pendulum(N)
 
     # Zero gravity, no stiffness or damping
     robot = robot.update_params(
-        {"g": jnp.array([0.0, 0.0]), "K": jnp.zeros((N, N)), "D": jnp.zeros((N, N))}
+        gravity=jnp.array([0.0, 0.0]),
+        joint_stiffness=jnp.zeros((N, N)),
+        joint_damping=jnp.zeros((N, N)),
     )
 
     q = jnp.zeros((N,))
@@ -372,8 +556,8 @@ def test_jacobian_matches_autodiff(N):
         J_analytical = robot.jacobian(q, jnp.array(s))
 
         # Autodiff Jacobian
-        def fk_at_s(q_):
-            return robot.forward_kinematics(q_, jnp.array(s))
+        def fk_at_s(q_, s_current=s):
+            return robot.forward_kinematics(q_, jnp.array(s_current))
 
         J_autodiff = jax.jacfwd(fk_at_s)(q)
 
@@ -383,20 +567,20 @@ def test_jacobian_matches_autodiff(N):
 
 
 @pytest.mark.parametrize("N", [2, 3])
-def test_jacobian_and_derivative_at_tips(N):
-    """Test jacobian_and_derivative at tips matches jacobian_and_derivatives_tips."""
+def test_jacobian_and_time_derivative_at_tips(N):
+    """Test jacobian_and_time_derivative at tips matches jacobian_and_time_derivatives_tips."""
     robot = make_pendulum(N)
     q = jnp.linspace(-0.3, 0.4, N)
     qd = jnp.linspace(0.6, -0.5, N)
 
     # Get from tips method
-    J_tips_direct, Jd_tips_direct = robot.jacobian_and_derivatives_tips(q, qd)
+    J_tips_direct, Jd_tips_direct = robot.jacobian_and_time_derivatives_tips(q, qd)
 
     # Get using arc-length method
     L_cum = onp.array(robot.L_cum)
     for i in range(N):
         s_tip = L_cum[i + 1]
-        J_s, Jd_s = robot.jacobian_and_derivative(q, qd, jnp.array(s_tip))
+        J_s, Jd_s = robot.jacobian_and_time_derivative(q, qd, jnp.array(s_tip))
         assert_allclose(
             J_s, J_tips_direct[i], rtol=Tolerance.rtol(), atol=Tolerance.atol()
         )
@@ -406,8 +590,8 @@ def test_jacobian_and_derivative_at_tips(N):
 
 
 @pytest.mark.parametrize("N", [2, 3])
-def test_jacobian_derivative_matches_jvp(N):
-    """Test that Jacobian derivative matches JVP."""
+def test_arc_length_jacobian_time_derivative_matches_jvp(N):
+    """Test that Jacobian time derivative matches JVP."""
     robot = make_pendulum(N)
     q = jnp.linspace(-0.3, 0.4, N)
     qd = jnp.linspace(0.6, -0.5, N)
@@ -420,11 +604,11 @@ def test_jacobian_derivative_matches_jvp(N):
         s_arr = jnp.array(s)
 
         # Closed-form
-        J_closed, Jd_closed = robot.jacobian_and_derivative(q, qd, s_arr)
+        J_closed, Jd_closed = robot.jacobian_and_time_derivative(q, qd, s_arr)
 
         # JVP
-        def J_of_q(q_):
-            return robot.jacobian(q_, s_arr)
+        def J_of_q(q_, s_current=s_arr):
+            return robot.jacobian(q_, s_current)
 
         _, Jd_jvp = jax.jvp(J_of_q, (q,), (qd,))
 
@@ -442,17 +626,19 @@ def test_batched_methods(N):
     s_ps = jnp.array(L_cum[1:])  # all tip positions
 
     # Forward kinematics batched
-    chi_batched = robot.forward_kinematics_batched(q, s_ps)
+    chi_batched = robot.forward_kinematics_abscissa_batched(q, s_ps)
     chi_tips = robot.forward_kinematics_tips(q)
     assert_allclose(chi_batched, chi_tips, rtol=Tolerance.rtol(), atol=Tolerance.atol())
 
     # Jacobian batched
-    J_batched = robot.jacobian_batched(q, s_ps)
+    J_batched = robot.jacobian_abscissa_batched(q, s_ps)
     J_tips = robot.jacobian_tips(q)
     assert_allclose(J_batched, J_tips, rtol=Tolerance.rtol(), atol=Tolerance.atol())
 
     # Jacobian and derivative batched
-    J_batched, Jd_batched = robot.jacobian_and_derivative_batched(q, qd, s_ps)
-    J_tips, Jd_tips = robot.jacobian_and_derivatives_tips(q, qd)
+    J_batched, Jd_batched = robot.jacobian_and_time_derivative_abscissa_batched(
+        q, qd, s_ps
+    )
+    J_tips, Jd_tips = robot.jacobian_and_time_derivatives_tips(q, qd)
     assert_allclose(J_batched, J_tips, rtol=Tolerance.rtol(), atol=Tolerance.atol())
     assert_allclose(Jd_batched, Jd_tips, rtol=Tolerance.rtol(), atol=Tolerance.atol())

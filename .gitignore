@@ -38,6 +38,10 @@ share/python-wheels/
 *.egg
 MANIFEST
 
+# Generated double-anonymous submission artifacts
+/anonymous-supplementary-material.zip
+/ANONYMIZATION_REPORT.txt
+
 # PyInstaller
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
@@ -147,8 +151,28 @@ dmypy.json
 *.mp4
 *.gif
 
+# Curated, web-optimized documentation media is intentionally versioned.
+!docs/assets/**/*.mp4
+!docs/assets/**/*.gif
+
+# Section Vd keeps canonical paper figures and robot renderings. The binary
+# video formats are routed through Git LFS in .gitattributes.
+!paper_results/secVd_control_gain_optimization/outputs/*.mp4
+!paper_results/secVd_control_gain_optimization/outputs/*.gif
+
+# Local diagnostics from superseded optimizer-embedded plotting are not
+# canonical Section Vd outputs.
+paper_results/secVd_control_gain_optimization/outputs/*_diagnostics/
+
+# Generated example artifacts stay next to the script that creates them.
+examples/**/figures/*
+examples/**/videos/*
+
 # Documentation build
 site/
+
+# Local Open3D native build artifacts
+/.open3d-uv-build/
 
 # ignore .claude settings
 .claude/

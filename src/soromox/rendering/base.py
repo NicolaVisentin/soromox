@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import warnings
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -10,7 +12,29 @@ import jax.numpy as jnp
 import numpy as np
 from jax import Array
 
-from soromox.rendering.color_config import (
+from soromox.actuation.threadlike import (
+    ConfigurationDependentThreadlikeRouting,
+    RoutingSolution,
+    ThreadlikeRouting,
+)
+from soromox.rendering.actuation import (
+    _fixed_routing_points,
+    _reshape_routing_solution,
+    _routing_solution_at,
+    _routing_visual_layers,
+    actuator_visual_layers,
+    vectorized_actuator_visual_layers_trajectory,
+)
+from soromox.rendering.actuators import (
+    ActuatorVisualLayer,
+    BatchedActuatorVisualLayer,
+    TrajectoryActuatorVisualLayer,
+    normalize_actuator_layers,
+    normalize_batched_actuator_layers,
+    normalize_trajectory_actuator_layers,
+)
+from soromox.rendering.config import RendererConfig
+from soromox.rendering.config.colors import (
     DEFAULT_ROBOT_PALETTE,
     DEFAULT_SEGMENT_PALETTE,
     ColorLegend,
@@ -19,6 +43,7 @@ from soromox.rendering.color_config import (
     normalize_color_array,
     normalize_palette,
 )
+from soromox.rendering.config.renderer import validate_config
 from soromox.systems.soft_robot import SoftRobot
 
 
@@ -45,47 +70,453 @@ class BaseSoftRobotRenderer(ABC):
         background_color: RGB tuple for background color (0-1 range)
         color_config: Shared color configuration for renderers
         L_max: Total length of the robot backbone
+        base_pose: Robot base pose coordinates. Planar robots use
+            ``[theta, x, y]``; spatial robots use scalar-last quaternion pose
+            ``[qx, qy, qz, qw, x, y, z]``.
+        base_transform: Homogeneous base transform. Shape ``(3, 3)`` for
+            planar robots and ``(4, 4)`` for spatial robots.
+        show_ground_plane: Whether supported backends render a ground reference
     """
 
     def __init__(
         self,
         robot: SoftRobot,
-        width: int = 800,
-        height: int = 600,
-        num_points: int = 50,
-        background_color: tuple[float, float, float] = (1.0, 1.0, 1.0),
-        color_config: RendererColorConfig | None = None,
+        config: RendererConfig | None = None,
     ):
         """Initialize the renderer with a robot and visualization parameters.
 
         Args:
-            robot: Robot system with forward_kinematics method and length property
-            width: Image width in pixels
-            height: Image height in pixels
-            num_points: Number of points for backbone curve discretization
-            background_color: RGB background color tuple (values 0-1)
-            color_config: Shared renderer color configuration
-        """
+            config: Shared scene, camera, color, geometry and output defaults.
+            robot: Robot system with forward_kinematics method and length property"""
+        self.config = copy.deepcopy(config or RendererConfig())
+        validate_config(self.config)
+        self._appearance_warnings = set()
+        width = self.config.output.width
+        height = self.config.output.height
+        num_points = self.config.geometry.num_points
+        background_color = self.config.scene.background
+        color_config = self.config.colors
+        show_ground_plane = self.config.scene.ground.visible
         self.robot: SoftRobot = robot
         self.width = width
         self.height = height
         self.num_points = num_points
         self.background_color = background_color
         self.color_config = color_config or RendererColorConfig()
+        self.show_ground_plane = bool(show_ground_plane)
         self._is_planar = bool(robot.is_planar)
+        if (
+            robot.floating_base
+            and self.config.scene.ground.height_reference == "base_mounting_face"
+        ):
+            raise ValueError(
+                "height_reference='base_mounting_face' is not supported for "
+                "floating-base robots; use height_reference='world'"
+            )
+        floating_base = robot.floating_base
+        initial_base_pose = (
+            robot._identity_base_pose if floating_base else robot.fixed_base_pose
+        )
+        assert initial_base_pose is not None
+        self.base_pose = jnp.asarray(initial_base_pose)
+        self.base_transform = jnp.asarray(robot.base_transform)
+        if self.config.scene.ground.height_reference == "base_mounting_face":
+            self._resolve_ground_height(
+                self._base_position(dim=3), self._base_tangent_axis(dim=3)
+            )
 
         self._color_cache: dict[tuple[int, int, int], ResolvedBackboneColors] = {}
         self._segment_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
 
         # Total robot length
         self.L_max = float(jnp.asarray(robot.length))
+        self._backbone_abscissae = jnp.linspace(0.0, self.L_max, self.num_points)
 
-        # Cache tendon FK if available
-        self._has_tendons = hasattr(robot, "forward_kinematics_tendons")
-        if self._has_tendons:
-            self._batched_fk_tendons = jax.vmap(
-                robot.forward_kinematics_tendons, in_axes=(None, 0), out_axes=1
+        # Explicit hooks let specialized and third-party robots override the
+        # generic renderer-owned SoftRobot adapter.
+        self._has_custom_actuator_visual_layers = callable(
+            getattr(robot, "actuator_visual_layers", None)
+        )
+        self._has_batched_actuator_visual_layers = hasattr(
+            robot, "actuator_visual_layers_batched"
+        )
+        self._has_trajectory_actuator_visual_layers = hasattr(
+            robot, "actuator_visual_layers_trajectory"
+        )
+        self._uses_generic_actuator_visual_adapter = (
+            isinstance(robot, SoftRobot) and not self._has_custom_actuator_visual_layers
+        )
+        self._has_actuator_visual_layers = (
+            self._has_custom_actuator_visual_layers
+            or self._uses_generic_actuator_visual_adapter
+        )
+        self._has_actuator_visuals = (
+            self._has_actuator_visual_layers
+            or self._has_batched_actuator_visual_layers
+            or self._has_trajectory_actuator_visual_layers
+        )
+
+    def _warn_appearance(self, mode: str, features: list[str]) -> None:
+        """Report unsupported or approximated appearance once per rendering mode.
+
+        Args:
+            mode: Rendering path, such as static, animated or export.
+            features: Human-readable descriptions of the approximations.
+
+        Returns:
+            None. Emits one UserWarning for a mode with unsupported features.
+        """
+        if features and mode not in self._appearance_warnings:
+            warnings.warn(
+                f"{type(self).__name__} ({mode}) approximates or ignores: "
+                + "; ".join(features),
+                UserWarning,
+                stacklevel=3,
             )
+            self._appearance_warnings.add(mode)
+
+    def _warn_simple_appearance(self, mode: str) -> None:
+        """Report unavailable lighting features for line and pixel renderers.
+
+        Args:
+            mode: Rendering operation used to deduplicate warnings.
+
+        Returns:
+            None. Emits a warning only when requested appearance is approximated.
+        """
+        cfg = self.config.scene
+        features = []
+        if type(self).__name__.startswith("OpenCV"):
+            features.append("camera uses the planar pixel projection")
+        if cfg.material.shading != "unlit":
+            features.append("surface lighting and materials rendered as colored lines")
+        if cfg.shadows or cfg.ambient_occlusion:
+            features.append("shadows and ambient occlusion unavailable")
+        if cfg.material.opacity < 1 or cfg.ground.opacity < 1:
+            features.append("transparency uses backend line/surface support")
+        if cfg.backdrop.enabled:
+            features.append("curved backdrop represented by the ground reference")
+        if (
+            self.config.camera.exposure_ev100 != 15
+            or cfg.tone_mapping != "backend-default"
+        ):
+            features.append("exposure/tone mapping ignored to preserve line colors")
+        self._warn_appearance(mode, features)
+
+    def _world_up(self) -> np.ndarray:
+        """Resolve the configured floor normal in spatial renderer coordinates.
+
+        Returns:
+            Unit three-vector; defaults to planar +Y or spatial +Z.
+        """
+        normal = self.config.scene.ground.normal
+        if normal is None:
+            normal = (0.0, 1.0, 0.0) if self._is_planar else (0.0, 0.0, 1.0)
+        n = np.asarray(normal, dtype=float)
+        return n / np.linalg.norm(n)
+
+    def _fit_scene_bounds(self, points, padding: float | None = None) -> None:
+        """Fit stable scenery bounds from a complete arrangement or trajectory.
+
+        Args:
+            points: Array with a final coordinate axis of length two or three.
+            padding: Optional radial padding in metres; defaults to the larger
+                of 5% of robot length and base plate thickness.
+
+        Returns:
+            None. Stores the center and maximum padded extent for scene setup.
+        """
+        if getattr(self, "_appearance_bounds_locked", False):
+            return
+        points = np.asarray(points).reshape(-1, np.shape(points)[-1])
+        if points.shape[1] == 2:
+            points = np.pad(points, ((0, 0), (0, 1)))
+        if not len(points):
+            return
+        margin = (
+            max(0.05 * self.L_max, self.config.geometry.base_plate_thickness)
+            if padding is None
+            else padding
+        )
+        lower, upper = points.min(axis=0) - margin, points.max(axis=0) + margin
+        self._appearance_center = (lower + upper) / 2
+        self._appearance_extent = max(float(np.max(upper - lower)), 0.001)
+
+    def _expand_scene_bounds_for_spheres(self, positions, radii=None) -> None:
+        """Expand scene bounds to enclose static or moving helper spheres.
+
+        Args:
+            positions: Optional helper centers or trajectories ending in three
+                coordinates, in metres.
+            radii: Optional sphere radii in metres; defaults to 0.02 metres.
+
+        Returns:
+            None. Enlarges stored scenery bounds without including the scenery.
+        """
+        if positions is None or not np.asarray(positions).size:
+            return
+        points = np.asarray(positions).reshape(-1, 3)
+        radius = 0.02 if radii is None else float(np.max(radii))
+        half = self._appearance_extent / 2
+        lower = np.minimum(self._appearance_center - half, points.min(axis=0) - radius)
+        upper = np.maximum(self._appearance_center + half, points.max(axis=0) + radius)
+        self._appearance_center = (lower + upper) / 2
+        self._appearance_extent = max(float(np.max(upper - lower)), 0.001)
+
+    def _resolve_ground_planes(self, curves, base_axes=None):
+        """Compute ground plane centers, unit normals and side lengths.
+
+        Args:
+            curves: Current backbone curves, shape (robots, points, 2 or 3).
+            base_axes: Optional material-frame tangent vectors, shape (robots, 3).
+
+        Returns:
+            List of (center, normal, side length) tuples. Centers and side lengths
+            are in metres. World alignment produces one plane; base alignment
+            produces one plane for each robot, displaced below its base plate.
+        """
+        cfg = self.config.scene.ground
+        curves = np.asarray(curves)
+        if not hasattr(self, "_appearance_extent"):
+            self._fit_scene_bounds(curves)
+        size = cfg.size or max(self._appearance_extent * 1.35, 0.1)
+        if cfg.alignment == "world":
+            n = self._world_up()
+            c = self._appearance_center
+            ground_height = self._resolve_ground_height(curves[:, 0], base_axes)
+            return [(c - (c @ n) * n + ground_height * n, n, size)]
+        count = len(curves)
+        normals = (
+            np.broadcast_to(self._base_tangent_axis(dim=3), (count, 3))
+            if base_axes is None
+            else np.asarray(base_axes)
+        )
+        normals = normals / np.linalg.norm(normals, axis=-1, keepdims=True)
+        centers = np.pad(curves[:, 0], ((0, 0), (0, 3 - curves.shape[-1])))
+        if cfg.height_reference not in ("world", "base_mounting_face"):
+            raise ValueError(f"Unknown ground height reference: {cfg.height_reference}")
+        # Base alignment is already anchored to each base plate. Its zero
+        # height is the mounting face, with cfg.height applying an offset from it.
+        base_offset = cfg.height - self.config.geometry.base_plate_thickness
+        centers = centers + base_offset * normals
+        return list(zip(centers, normals, np.full(count, size)))
+
+    def _resolve_ground_height(self, base_points=None, base_axes=None) -> float:
+        """Resolve a world-aligned floor height from the configured reference.
+
+        Args:
+            base_points: Robot base points in renderer coordinates. Required for
+                ``height_reference="base_mounting_face"`` when a world floor is used.
+            base_axes: Optional base plate axes in renderer coordinates. A base
+                mounting face reference requires every axis to be parallel or
+                antiparallel to the floor normal.
+
+        Returns:
+            World-space signed height along the configured floor normal.
+
+        Raises:
+            ValueError: Base-referenced world floors have different base heights.
+        """
+        cfg = self.config.scene.ground
+        if cfg.height_reference == "world":
+            return float(cfg.height)
+        if cfg.height_reference != "base_mounting_face":
+            raise ValueError(f"Unknown ground height reference: {cfg.height_reference}")
+        if self.robot.floating_base:
+            raise ValueError(
+                "height_reference='base_mounting_face' is not supported for "
+                "floating-base robots; use height_reference='world'"
+            )
+        if self._is_planar:
+            raise ValueError(
+                "height_reference='base_mounting_face' requires a spatial fixed-base "
+                "robot with a base axis parallel or antiparallel to the floor normal"
+            )
+        if base_points is None:
+            base_points = self._base_position(dim=3)
+        points = np.asarray(base_points, dtype=np.float64)
+        if points.ndim == 1:
+            points = points[None, :]
+        if points.ndim != 2 or points.shape[1] not in (2, 3):
+            raise ValueError("base_points must have shape (N, 2) or (N, 3)")
+        if points.shape[1] == 2:
+            points = np.pad(points, ((0, 0), (0, 1)))
+        normal = self._world_up()
+        if base_axes is None:
+            axes = np.broadcast_to(self._base_tangent_axis(dim=3), (len(points), 3))
+        else:
+            axes = np.asarray(base_axes, dtype=np.float64)
+            if axes.ndim == 1:
+                axes = axes[None, :]
+            if axes.ndim != 2 or axes.shape[1] not in (2, 3):
+                raise ValueError("base_axes must have shape (N, 2) or (N, 3)")
+            if axes.shape[1] == 2:
+                axes = np.pad(axes, ((0, 0), (0, 1)))
+            axes = axes / np.linalg.norm(axes, axis=-1, keepdims=True)
+        if len(axes) != len(points):
+            raise ValueError("base_points and base_axes must have matching rows")
+        axis_alignment = np.abs(axes @ normal)
+        if not np.allclose(axis_alignment, 1.0):
+            raise ValueError(
+                "height_reference='base_mounting_face' requires the base axis to be "
+                "parallel or antiparallel to the floor normal (+z or -z for the "
+                "default spatial floor)"
+            )
+        base_heights = points @ normal - self.config.geometry.base_plate_thickness * (
+            axes @ normal
+        )
+        if not np.allclose(base_heights, base_heights[0]):
+            raise ValueError(
+                "height_reference='base_mounting_face' with world alignment requires "
+                "all robot base mounting faces to share one height; use "
+                "alignment='base' for separate base planes"
+            )
+        return float(base_heights[0] + cfg.height)
+
+    def _base_position(self, dim: int | None = None) -> np.ndarray:
+        """Return the configured base translation in renderer coordinates.
+
+        Args:
+            dim: Optional target dimension. ``2`` returns ``[x, y]``; ``3``
+                returns ``[x, y, z]`` with planar bases padded by ``z = 0``.
+                If omitted, the renderer dimensionality is used.
+
+        Returns:
+            Base position as a NumPy array with shape ``(dim,)``.
+        """
+        target_dim = 3 if (dim is None and self.is_3d) else 2 if dim is None else dim
+        transform = np.asarray(self.base_transform, dtype=np.float64)
+        if transform.shape == (3, 3):
+            pos = np.array([transform[0, 2], transform[1, 2]], dtype=np.float64)
+        elif transform.shape == (4, 4):
+            pos = np.asarray(transform[:3, 3], dtype=np.float64)
+        else:
+            raise ValueError(
+                "base_transform must have shape (3, 3) or (4, 4), "
+                f"got {transform.shape}."
+            )
+        return self._match_vector_dim(pos, target_dim, name="base position")
+
+    def _base_tangent_axis(self, dim: int | None = None) -> np.ndarray:
+        """Return the configured base-frame +x direction.
+
+        The soft-robot convention is that zero base rotation aligns the
+        undeformed backbone with the positive base-frame x-axis. This helper
+        returns that axis after applying ``base_transform``.
+
+        Args:
+            dim: Optional target dimension. ``2`` returns the planar xy axis;
+                ``3`` returns xyz, padding planar axes by ``z = 0``.
+
+        Returns:
+            Unit vector as a NumPy array with shape ``(dim,)``.
+        """
+        target_dim = 3 if (dim is None and self.is_3d) else 2 if dim is None else dim
+        transform = np.asarray(self.base_transform, dtype=np.float64)
+        if transform.shape == (3, 3):
+            axis = np.asarray(transform[:2, 0], dtype=np.float64)
+        elif transform.shape == (4, 4):
+            axis = np.asarray(transform[:3, 0], dtype=np.float64)
+        else:
+            raise ValueError(
+                "base_transform must have shape (3, 3) or (4, 4), "
+                f"got {transform.shape}."
+            )
+        axis = self._match_vector_dim(axis, target_dim, name="base tangent axis")
+        norm = np.linalg.norm(axis)
+        if norm <= 1e-12:
+            fallback = np.zeros(target_dim, dtype=np.float64)
+            fallback[0] = 1.0
+            return fallback
+        return axis / norm
+
+    @staticmethod
+    def _match_vector_dim(
+        value: np.ndarray,
+        target_dim: int,
+        *,
+        name: str,
+    ) -> np.ndarray:
+        """Return ``value`` with dimension ``target_dim`` by optional z-padding."""
+        vector = np.asarray(value, dtype=np.float64).reshape(-1)
+        if vector.shape[0] == target_dim:
+            return vector
+        if vector.shape[0] + 1 == target_dim:
+            return np.concatenate([vector, np.zeros(1, dtype=np.float64)])
+        if target_dim == 2 and vector.shape[0] == 3:
+            return vector[:2]
+        raise ValueError(
+            f"{name} must have dimension {target_dim}, got {vector.shape}."
+        )
+
+    def _normalize_base_offsets(
+        self,
+        base_offsets: Array | np.ndarray,
+        *,
+        num_robots: int,
+        target_dim: int,
+        allow_single: bool = False,
+        allow_extra_rows: bool = False,
+        name: str = "base_offsets",
+    ) -> jax.Array:
+        """Validate and dimension-match per-robot positional base offsets.
+
+        Args:
+            base_offsets: Offset array. Expected shape is ``(N, dim)`` for
+                batched calls. If ``allow_single`` is true, ``(dim,)`` and
+                ``(1, dim)`` are accepted for a single robot.
+            num_robots: Required number of rows.
+            target_dim: Desired spatial dimension, usually the curve dimension.
+            allow_single: Whether to accept a one-dimensional single offset.
+            allow_extra_rows: Whether to accept more rows than ``num_robots``
+                and use the leading ``num_robots`` rows. Intended for
+                constructor-level layout configurations reused across smaller
+                batches.
+            name: Name used in error messages.
+
+        Returns:
+            JAX array with shape ``(num_robots, target_dim)``. 2D offsets are
+            padded with ``z = 0`` when ``target_dim == 3``.
+        """
+        offsets = jnp.asarray(base_offsets)
+        if offsets.ndim == 1 and allow_single:
+            offsets = offsets.reshape(1, -1)
+        if offsets.ndim != 2:
+            raise ValueError(f"{name} must have shape (N, dim), got {offsets.shape}.")
+        if allow_extra_rows and offsets.shape[0] > num_robots:
+            offsets = offsets[:num_robots]
+        if offsets.shape[0] != num_robots:
+            raise ValueError(
+                f"{name} first dimension ({offsets.shape[0]}) must match "
+                f"number of robots ({num_robots})."
+            )
+        if offsets.shape[1] == target_dim:
+            return offsets
+        if offsets.shape[1] + 1 == target_dim:
+            pad = jnp.zeros((offsets.shape[0], 1), dtype=offsets.dtype)
+            return jnp.concatenate([offsets, pad], axis=1)
+        raise ValueError(
+            f"{name} must have shape ({num_robots}, {target_dim}) or "
+            f"({num_robots}, {target_dim - 1}), got {offsets.shape}."
+        )
+
+    def _single_base_offset(
+        self,
+        base_offsets: Array | np.ndarray | None,
+        *,
+        target_dim: int,
+        allow_extra_rows: bool = False,
+    ) -> jax.Array | None:
+        """Return a single normalized base offset or ``None``."""
+        if base_offsets is None:
+            return None
+        return self._normalize_base_offsets(
+            base_offsets,
+            num_robots=1,
+            target_dim=target_dim,
+            allow_single=True,
+            allow_extra_rows=allow_extra_rows,
+        )[0]
 
     @property
     def is_planar(self) -> bool:
@@ -106,64 +537,574 @@ class BaseSoftRobotRenderer(ABC):
         Returns:
             Array of shape (num_points, 3) for 3D or (num_points, 2) for 2D
         """
-        s_ps = jnp.linspace(0.0, self.L_max, self.num_points)
-        if hasattr(self.robot, "forward_kinematics_batched"):
-            poses = self.robot.forward_kinematics_batched(q, s_ps)
-        else:
-            # Fallback to vmap over single-point FK
-            poses = jax.vmap(lambda s: self.robot.forward_kinematics(q, s))(s_ps)
-
-        # extract positions
+        poses = self.compute_backbone_poses(q)
         curve = self._extract_positions(poses)  # (num_points, dim)
 
         return curve
 
-    def compute_tendon_curves(self, q: Array) -> Array | None:
-        """Compute tendon paths if the robot supports tendon kinematics."""
-        if not self._has_tendons:
-            return None
-        s_ps = jnp.linspace(0.0, self.L_max, self.num_points)
-        return self._batched_fk_tendons(q, s_ps)
+    def compute_backbone_poses(self, q: Array) -> Array:
+        """Compute full FK poses at the configured backbone sample points."""
+        if self.robot.floating_base:
+            base_pose, _ = self.robot.split_configuration(q)
+            assert base_pose is not None
+            self.base_pose = jnp.asarray(base_pose)
+            self.base_transform = jnp.asarray(
+                self.robot.base_transform_from_configuration(q)
+            )
+        s_ps = self._backbone_abscissae
+        return self.robot.forward_kinematics_abscissa_batched(q, s_ps)
 
-    def compute_tendon_curves_batched(
-        self, q_batch: Array, base_offsets: Array
+    def _routing_points_for_backend(self, points):
+        """Match world positions to this renderer's spatial dimension.
+
+        Args:
+            points: Positions with arbitrary leading axes and final axis 2 or 3.
+
+        Returns:
+            Positions with final axis 2 for planar renderers or 3 for spatial
+            renderers. Planar world positions gain ``z=0`` in a spatial scene.
+        """
+        dim = 3 if self.is_3d else 2
+        if points.shape[-1] < dim:
+            points = jnp.pad(points, [(0, 0)] * (points.ndim - 1) + [(0, 1)])
+        return points[..., :dim]
+
+    def _routing_layers(self, q, routing, solution):
+        """Sample optional routing in world coordinates for this backend.
+
+        Args:
+            q: Single configuration, shape ``(robot.num_coordinates,)``.
+            routing: Optional fixed or configuration-dependent routing strategy.
+            solution: Matching configuration-dependent solution, or ``None`` to
+                solve once. Must be ``None`` for fixed routing.
+
+        Returns:
+            One layer per physical path with shape ``(1, samples_in_path, dim)``.
+            Planar renderers retain world x/y; spatial renderers retain x/y/z.
+            Positions are in metres, before display offsets.
+
+        Raises:
+            ValueError: A solution lacks routing or its topology, convergence,
+                configuration shape, or sampled geometry is invalid.
+        """
+        layers = _routing_visual_layers(
+            self.robot, q, routing, solution=solution, s_points=self._backbone_abscissae
+        )
+        return tuple(
+            layer.with_points(self._routing_points_for_backend(layer.points))
+            for layer in layers
+        )
+
+    def compute_actuator_visual_layers(
+        self,
+        q: Array,
+        *,
+        actuator_inputs: Array | None = None,
+        routing: ThreadlikeRouting
+        | ConfigurationDependentThreadlikeRouting
+        | None = None,
+        routing_solution: RoutingSolution | None = None,
+    ) -> tuple[ActuatorVisualLayer, ...]:
+        """Combine installed actuators with optional resolved routing for one robot.
+
+        Args:
+            q: Generalized coordinates, shape ``(robot.num_coordinates,)``.
+            actuator_inputs: Optional installed actuator inputs, shape
+                ``(robot.num_actuators,)``.
+            routing: Optional fixed or configuration-dependent routing, using
+                the configured tendon style and sampling resolution.
+            routing_solution: Solution for exactly this robot, routing, and ``q``.
+                Reused without solving; omitted solutions are solved once. Must be
+                ``None`` for fixed routing, which is evaluated directly.
+
+        Returns:
+            Installed layers followed by optional routing layers in world
+            coordinates (metres), with no display offsets. Each layer has shape
+            ``(channels, samples, dim)``.
+
+        Raises:
+            ValueError: Routing inputs or geometry are invalid. The caller must
+                ensure a supplied solution matches the configuration and model.
+        """
+        layers = self._compute_installed_actuator_visual_layers(
+            q, actuator_inputs=actuator_inputs
+        )
+        return layers + self._routing_layers(q, routing, routing_solution)
+
+    def _routing_layers_batched(self, q, routing, solution, *, trajectory=False):
+        """Sample routes independently while preserving batch/time ordering.
+
+        Args:
+            q: Normalized configurations, shape ``(N, DOF)`` or ``(N, T, DOF)``.
+            routing: Optional fixed or configuration-dependent routing strategy.
+            solution: Matching solution PyTree with the same leading axes as
+                ``q``. Singleton axes may be omitted; ``None`` solves each state.
+                Must be ``None`` for fixed routing, which is vectorized over states.
+            trajectory: Select trajectory rather than batch layer containers.
+
+        Returns:
+            Layers with points shaped ``(*q.shape[:-1], 1, samples_in_path, dim)``
+            in world coordinates, before layout offsets. Empty without routing.
+
+        Raises:
+            ValueError: Solution axes do not match, a solution lacks routing,
+                or a sampled route is invalid.
+        """
+        if routing is None:
+            if solution is not None:
+                raise ValueError(
+                    "routing is required when routing_solution is supplied."
+                )
+            return ()
+        q = jnp.asarray(q)
+        expected_ndim = 3 if trajectory else 2
+        if q.ndim != expected_ndim:
+            raise ValueError(f"q must have {expected_ndim} axes, got shape {q.shape}.")
+        layer_type = (
+            TrajectoryActuatorVisualLayer if trajectory else BatchedActuatorVisualLayer
+        )
+        if isinstance(routing, ThreadlikeRouting):
+            points = self._routing_points_for_backend(
+                _fixed_routing_points(
+                    self.robot, q, routing, self._backbone_abscissae, solution
+                )
+            )
+            return tuple(
+                layer_type(
+                    name=f"routing/path_{index}",
+                    kind="tendon",
+                    points=points[..., index : index + 1, :, :],
+                )
+                for index in range(routing.num_paths)
+            )
+        shape = q.shape[:-1]
+        solution = _reshape_routing_solution(solution, shape)
+        frames = [
+            self._routing_layers(
+                q[index], routing, _routing_solution_at(solution, index)
+            )
+            for index in np.ndindex(shape)
+        ]
+        if not frames:
+            return ()
+        return tuple(
+            layer_type(
+                name=layer.name,
+                kind=layer.kind,
+                points=jnp.stack([frame[i].points for frame in frames]).reshape(
+                    (*shape, *layer.points.shape)
+                ),
+            )
+            for i, layer in enumerate(frames[0])
+        )
+
+    def compute_actuator_visual_layers_batched(
+        self,
+        q_batch: Array,
+        base_offsets: Array,
+        *,
+        actuator_inputs: Array | np.ndarray | None = None,
+        routing: ThreadlikeRouting
+        | ConfigurationDependentThreadlikeRouting
+        | None = None,
+        routing_solution: RoutingSolution | None = None,
+    ) -> tuple[BatchedActuatorVisualLayer, ...]:
+        """Combine actuator layers for ``(N, DOF)`` configurations.
+
+        Args:
+            q_batch: Configurations, shape ``(N, robot.num_coordinates)``.
+            base_offsets: Display translations, shape ``(N, 2)`` or ``(N, 3)``.
+            actuator_inputs: Optional installed inputs, shape
+                ``(N, robot.num_actuators)`` (or a single vector for ``N=1``).
+            routing: Optional fixed or configuration-dependent routing.
+            routing_solution: Solutions with leading axis ``N`` on every leaf.
+                A single solution is accepted only for ``N=1``. Omit to solve
+                each configuration; supplied solutions must match their states.
+                Must be ``None`` for fixed routing, which is evaluated directly.
+
+        Returns:
+            Layers with points shaped ``(N, channels, samples, dim)`` in metres.
+            Display offsets are applied once after world geometry is sampled.
+
+        Raises:
+            ValueError: Configuration/solution axes, display offsets, or routes
+                are invalid. Solutions are never broadcast across robots.
+        """
+        layers = self._compute_installed_actuator_visual_layers_batched(
+            q_batch, base_offsets, actuator_inputs=actuator_inputs
+        )
+        extra = self._routing_layers_batched(q_batch, routing, routing_solution)
+        return layers + self._offset_batched_actuator_layers(extra, base_offsets)
+
+    def compute_actuator_visual_layers_trajectory(
+        self,
+        q_ts: Array,
+        base_offsets: Array,
+        *,
+        actuator_inputs: Array | np.ndarray | None = None,
+        routing: ThreadlikeRouting
+        | ConfigurationDependentThreadlikeRouting
+        | None = None,
+        routing_solution: RoutingSolution | None = None,
+    ) -> tuple[TrajectoryActuatorVisualLayer, ...]:
+        """Combine actuator layers for ``(N, T, DOF)`` trajectories.
+
+        Args:
+            q_ts: Configurations, shape ``(N, T, robot.num_coordinates)``.
+            base_offsets: Display translations, shape ``(N, 2)`` or ``(N, 3)``.
+            actuator_inputs: Optional inputs with leading ``(N, T)`` axes, or
+                ``(N,)`` for inputs constant over time. For a single robot,
+                a ``(T, channels)`` array or constant channel vector is accepted.
+            routing: Optional fixed or configuration-dependent routing.
+            routing_solution: Solutions with leading axes ``(N, T)`` in the same
+                order as ``q_ts``. Singleton robot/time axes may be omitted.
+                Supplied solutions are reused; omitting them solves each state.
+                Must be ``None`` for fixed routing, which is evaluated directly.
+
+        Returns:
+            Layers with points shaped ``(N, T, channels, samples, dim)`` in metres,
+            including display offsets applied once after world-space sampling.
+
+        Raises:
+            ValueError: Configuration/solution axes, display offsets, or routes
+                are invalid. Solutions are never broadcast across states.
+        """
+        layers = self._compute_installed_actuator_visual_layers_trajectory(
+            q_ts, base_offsets, actuator_inputs=actuator_inputs
+        )
+        extra = self._routing_layers_batched(
+            q_ts, routing, routing_solution, trajectory=True
+        )
+        return layers + self._offset_trajectory_actuator_layers(extra, base_offsets)
+
+    def _compute_installed_actuator_visual_layers(
+        self,
+        q: Array,
+        *,
+        actuator_inputs: Array | None = None,
+    ) -> tuple[ActuatorVisualLayer, ...]:
+        """Compute renderer-facing actuator visual layers for one robot."""
+        if not self._has_actuator_visual_layers:
+            return ()
+        s_ps = self._backbone_abscissae
+        if self._uses_generic_actuator_visual_adapter:
+            layers = actuator_visual_layers(
+                self.robot, q, s_ps, actuator_inputs=actuator_inputs
+            )
+        else:
+            layers = self.robot.actuator_visual_layers(  # type: ignore[attr-defined]
+                q, s_ps, actuator_inputs=actuator_inputs
+            )
+        return normalize_actuator_layers(layers)
+
+    def _offset_batched_actuator_layers(
+        self,
+        layers: tuple[BatchedActuatorVisualLayer, ...],
+        base_offsets: Array | np.ndarray,
+    ) -> tuple[BatchedActuatorVisualLayer, ...]:
+        """Apply per-robot base offsets to batched actuator layer points."""
+        offset_layers: list[BatchedActuatorVisualLayer] = []
+        for layer in layers:
+            points = jnp.asarray(layer.points)
+            offsets = self._normalize_base_offsets(
+                base_offsets,
+                num_robots=int(points.shape[0]),
+                target_dim=int(points.shape[-1]),
+            )
+            offset_layers.append(layer.with_points(points + offsets[:, None, None, :]))
+        return tuple(offset_layers)
+
+    def _offset_trajectory_actuator_layers(
+        self,
+        layers: tuple[TrajectoryActuatorVisualLayer, ...],
+        base_offsets: Array | np.ndarray,
+    ) -> tuple[TrajectoryActuatorVisualLayer, ...]:
+        """Apply per-robot base offsets to trajectory actuator layer points."""
+        offset_layers: list[TrajectoryActuatorVisualLayer] = []
+        for layer in layers:
+            points = jnp.asarray(layer.points)
+            offsets = self._normalize_base_offsets(
+                base_offsets,
+                num_robots=int(points.shape[0]),
+                target_dim=int(points.shape[-1]),
+            )
+            offset_layers.append(
+                layer.with_points(points + offsets[:, None, None, None, :])
+            )
+        return tuple(offset_layers)
+
+    @staticmethod
+    def _stack_optional_arrays(
+        values: list[Array | np.ndarray | list | tuple | None],
+        *,
+        name: str,
+        layer_name: str,
     ) -> Array | None:
-        """Compute tendon paths for multiple robots with base offsets."""
-        if not self._has_tendons:
+        if all(value is None for value in values):
             return None
+        if any(value is None for value in values):
+            raise ValueError(
+                f"{name} for actuator layer {layer_name!r} must be provided for "
+                "all robots/timesteps or none."
+            )
+        return jnp.stack([jnp.asarray(value) for value in values])
+
+    @staticmethod
+    def _stack_radius(values: list[float | Array | None]) -> float | Array | None:
+        if all(value is None for value in values):
+            return None
+        first = values[0]
+        if first is None:
+            return None
+        if np.asarray(first).ndim == 0:
+            return first
+        return jnp.stack([jnp.asarray(value) for value in values])
+
+    @staticmethod
+    def _stack_scalar_fields(
+        layers: list[ActuatorVisualLayer | BatchedActuatorVisualLayer],
+    ) -> dict[str, Array]:
+        first_keys = tuple(layers[0].scalar_fields.keys())
+        stacked: dict[str, Array] = {}
+        for layer in layers[1:]:
+            if tuple(layer.scalar_fields.keys()) != first_keys:
+                raise ValueError(
+                    f"Actuator layer {layers[0].name!r} scalar field keys must "
+                    "match across robots/timesteps."
+                )
+        for key in first_keys:
+            stacked[key] = jnp.stack(
+                [jnp.asarray(layer.scalar_fields[key]) for layer in layers]
+            )
+        return stacked
+
+    @staticmethod
+    def _validate_matching_layers(
+        reference: tuple[ActuatorVisualLayer, ...],
+        candidate: tuple[ActuatorVisualLayer, ...],
+    ) -> None:
+        if len(candidate) != len(reference):
+            raise ValueError(
+                "All robots must expose the same number of actuator visual layers."
+            )
+        for ref_layer, layer in zip(reference, candidate):
+            if (layer.name, layer.kind) != (ref_layer.name, ref_layer.kind):
+                raise ValueError(
+                    "Actuator visual layer names and kinds must match across "
+                    "robots/timesteps."
+                )
+            if jnp.asarray(layer.points).shape != jnp.asarray(ref_layer.points).shape:
+                raise ValueError(
+                    f"Actuator visual layer {layer.name!r} shape changed from "
+                    f"{jnp.asarray(ref_layer.points).shape} to "
+                    f"{jnp.asarray(layer.points).shape}."
+                )
+
+    @staticmethod
+    def _actuator_inputs_for_batch(
+        actuator_inputs: Array | np.ndarray | None,
+        *,
+        num_robots: int,
+    ) -> list[Array | None]:
+        if actuator_inputs is None:
+            return [None] * num_robots
+        inputs = jnp.asarray(actuator_inputs)
+        if inputs.ndim >= 2 and inputs.shape[0] == num_robots:
+            return [inputs[i] for i in range(num_robots)]
+        if num_robots == 1:
+            return [inputs]
+        raise ValueError(
+            "Batched actuator_inputs must have leading dimension matching the "
+            f"number of robots ({num_robots}), got {inputs.shape}."
+        )
+
+    @staticmethod
+    def _actuator_inputs_for_timestep(
+        actuator_inputs: Array | np.ndarray | None,
+        *,
+        num_robots: int,
+        num_steps: int,
+        frame_idx: int,
+    ) -> Array | np.ndarray | None:
+        if actuator_inputs is None:
+            return None
+        inputs = jnp.asarray(actuator_inputs)
+        if inputs.ndim >= 3 and inputs.shape[:2] == (num_robots, num_steps):
+            return inputs[:, frame_idx]
+        if inputs.ndim >= 2 and inputs.shape[0] == num_steps:
+            return inputs[frame_idx]
+        return inputs
+
+    def _compute_installed_actuator_visual_layers_batched(
+        self,
+        q_batch: Array,
+        base_offsets: Array,
+        *,
+        actuator_inputs: Array | np.ndarray | None = None,
+    ) -> tuple[BatchedActuatorVisualLayer, ...]:
+        """Compute actuator visual layers for multiple robots with base offsets."""
+        if not self._has_actuator_visuals:
+            return ()
 
         q_batch = jnp.asarray(q_batch)
-        base_offsets = jnp.asarray(base_offsets)
-
         if q_batch.ndim != 2:
             raise ValueError(
                 f"q_batch must have shape (N, DOF), got {q_batch.shape} with ndim={q_batch.ndim}"
             )
-        if base_offsets.ndim != 2:
-            raise ValueError(
-                f"base_offsets must have shape (N, dim), got {base_offsets.shape}"
-            )
-        if base_offsets.shape[0] != q_batch.shape[0]:
-            raise ValueError(
-                f"base_offsets first dimension ({base_offsets.shape[0]}) must "
-                f"match batch size ({q_batch.shape[0]})"
-            )
+        num_robots = int(q_batch.shape[0])
 
-        s_ps = jnp.linspace(0.0, self.L_max, self.num_points)
-        tendon_curves = jax.vmap(lambda q: self._batched_fk_tendons(q, s_ps))(q_batch)
-
-        if base_offsets.shape[1] == tendon_curves.shape[-1]:
-            offsets = base_offsets
-        elif base_offsets.shape[1] + 1 == tendon_curves.shape[-1]:
-            pad = jnp.zeros((base_offsets.shape[0], 1), dtype=tendon_curves.dtype)
-            offsets = jnp.concatenate([base_offsets, pad], axis=1)
-        else:
-            raise ValueError(
-                f"base_offsets must have shape (N, {tendon_curves.shape[-1]}) or "
-                f"(N, {tendon_curves.shape[-1] - 1}), got {base_offsets.shape}"
+        if self._has_batched_actuator_visual_layers:
+            s_ps = self._backbone_abscissae
+            raw_layers = self.robot.actuator_visual_layers_batched(  # type: ignore[attr-defined]
+                q_batch,
+                s_ps,
+                actuator_inputs=actuator_inputs,
             )
+            layers = normalize_batched_actuator_layers(
+                raw_layers, num_robots=num_robots
+            )
+            return self._offset_batched_actuator_layers(layers, base_offsets)
 
-        return tendon_curves + offsets[:, None, None, :]
+        if not self._has_actuator_visual_layers:
+            return ()
+
+        inputs_by_robot = self._actuator_inputs_for_batch(
+            actuator_inputs, num_robots=num_robots
+        )
+        layers_by_robot = [
+            self.compute_actuator_visual_layers(
+                q_batch[i], actuator_inputs=inputs_by_robot[i]
+            )
+            for i in range(num_robots)
+        ]
+        if not layers_by_robot or not layers_by_robot[0]:
+            return ()
+        reference = layers_by_robot[0]
+        for layers in layers_by_robot[1:]:
+            self._validate_matching_layers(reference, layers)
+
+        batched_layers: list[BatchedActuatorVisualLayer] = []
+        for layer_idx, ref_layer in enumerate(reference):
+            robot_layers = [layers[layer_idx] for layers in layers_by_robot]
+            points = jnp.stack([jnp.asarray(layer.points) for layer in robot_layers])
+            colors = self._stack_optional_arrays(
+                [layer.colors for layer in robot_layers],
+                name="colors",
+                layer_name=ref_layer.name,
+            )
+            scalar_fields = self._stack_scalar_fields(robot_layers)
+            batched_layers.append(
+                BatchedActuatorVisualLayer(
+                    name=ref_layer.name,
+                    kind=ref_layer.kind,
+                    points=points,
+                    radius=self._stack_radius([layer.radius for layer in robot_layers]),
+                    line_width=ref_layer.line_width,
+                    colors=colors,
+                    scalar_fields=scalar_fields,
+                )
+            )
+        return self._offset_batched_actuator_layers(tuple(batched_layers), base_offsets)
+
+    def _compute_installed_actuator_visual_layers_trajectory(
+        self,
+        q_ts: Array,
+        base_offsets: Array,
+        *,
+        actuator_inputs: Array | np.ndarray | None = None,
+    ) -> tuple[TrajectoryActuatorVisualLayer, ...]:
+        """Compute actuator visual layers for ``(N, T, DOF)`` trajectories."""
+        q_ts = jnp.asarray(q_ts)
+        if q_ts.ndim != 3:
+            raise ValueError(
+                f"q_ts must have shape (N, T, DOF), got {q_ts.shape} with ndim={q_ts.ndim}"
+            )
+        num_robots, num_steps, _ = q_ts.shape
+
+        if self._has_trajectory_actuator_visual_layers:
+            s_ps = self._backbone_abscissae
+            raw_layers = self.robot.actuator_visual_layers_trajectory(  # type: ignore[attr-defined]
+                q_ts,
+                s_ps,
+                actuator_inputs=actuator_inputs,
+            )
+            layers = normalize_trajectory_actuator_layers(
+                raw_layers,
+                num_robots=int(num_robots),
+                num_steps=int(num_steps),
+            )
+            return self._offset_trajectory_actuator_layers(layers, base_offsets)
+
+        # Generic SoftRobot geometry is renderer-owned and JAX-vectorizable.
+        # Specialized robot hooks take precedence in the branch above.
+        if self._uses_generic_actuator_visual_adapter:
+            s_ps = self._backbone_abscissae
+            raw_layers = vectorized_actuator_visual_layers_trajectory(
+                self.robot,
+                q_ts,
+                s_ps,
+                actuator_inputs=actuator_inputs,
+            )
+            layers = normalize_trajectory_actuator_layers(
+                raw_layers,
+                num_robots=int(num_robots),
+                num_steps=int(num_steps),
+            )
+            return self._offset_trajectory_actuator_layers(layers, base_offsets)
+
+        if not (
+            self._has_batched_actuator_visual_layers or self._has_actuator_visual_layers
+        ):
+            return ()
+
+        layers_by_time = []
+        for frame_idx in range(int(num_steps)):
+            frame_inputs = self._actuator_inputs_for_timestep(
+                actuator_inputs,
+                num_robots=int(num_robots),
+                num_steps=int(num_steps),
+                frame_idx=frame_idx,
+            )
+            layers_by_time.append(
+                self.compute_actuator_visual_layers_batched(
+                    q_ts[:, frame_idx, :],
+                    base_offsets,
+                    actuator_inputs=frame_inputs,
+                )
+            )
+        if not layers_by_time or not layers_by_time[0]:
+            return ()
+
+        trajectory_layers: list[TrajectoryActuatorVisualLayer] = []
+        for layer_idx, ref_layer in enumerate(layers_by_time[0]):
+            time_layers = [layers[layer_idx] for layers in layers_by_time]
+            points = jnp.stack([layer.points for layer in time_layers], axis=1)
+            colors = self._stack_optional_arrays(
+                [layer.colors for layer in time_layers],
+                name="colors",
+                layer_name=ref_layer.name,
+            )
+            if colors is not None:
+                colors = jnp.moveaxis(colors, 0, 1)
+            scalar_fields = {
+                key: jnp.stack(
+                    [jnp.asarray(layer.scalar_fields[key]) for layer in time_layers],
+                    axis=1,
+                )
+                for key in ref_layer.scalar_fields
+            }
+            trajectory_layers.append(
+                TrajectoryActuatorVisualLayer(
+                    name=ref_layer.name,
+                    kind=ref_layer.kind,
+                    points=points,
+                    radius=ref_layer.radius,
+                    line_width=ref_layer.line_width,
+                    colors=colors,
+                    scalar_fields=scalar_fields,
+                )
+            )
+        return tuple(trajectory_layers)
 
     def _extract_positions(self, poses: Array) -> Array:
         """Extract xyz or xy positions from FK poses.
@@ -226,6 +1167,11 @@ class BaseSoftRobotRenderer(ABC):
         if poses.ndim == 3 and poses.shape[-2:] == (4, 4):
             # SE(3): extract translation from 4x4 matrices
             return poses[:, :3, 3]
+        elif poses.ndim == 3 and poses.shape[-2:] == (3, 3):
+            # Homogeneous SE(2): extract x, y and pad with z=0
+            xy = poses[:, :2, 2]
+            z = jnp.zeros((poses.shape[0], 1), dtype=poses.dtype)
+            return jnp.concatenate([xy, z], axis=1)
         elif poses.ndim == 2 and poses.shape[-1] == 3:
             # SE(2): extract x, y from [theta, x, y] and pad with z=0
             xy = poses[:, 1:3]  # Extract x, y (skip theta at index 0)
@@ -236,6 +1182,36 @@ class BaseSoftRobotRenderer(ABC):
                 f"Unsupported pose format: expected SE(2) (N, 3) or SE(3) (N, 4, 4), "
                 f"got shape {poses.shape}"
             )
+
+    def _extract_material_frames_3d(self, poses: Array) -> Array:
+        """Extract 3D material-frame rotations from SE(2) or SE(3) poses."""
+        poses = jnp.asarray(poses)
+        if poses.ndim == 3 and poses.shape[-2:] == (4, 4):
+            return poses[:, :3, :3]
+        if poses.ndim == 3 and poses.shape[-2:] == (3, 3):
+            rotations = poses[:, :2, :2]
+            frames = jnp.zeros((poses.shape[0], 3, 3), dtype=poses.dtype)
+            frames = frames.at[:, :2, :2].set(rotations)
+            return frames.at[:, 2, 2].set(1.0)
+        if poses.ndim == 2 and poses.shape[-1] == 3:
+            theta = poses[:, 0]
+            cos_theta = jnp.cos(theta)
+            sin_theta = jnp.sin(theta)
+            zeros = jnp.zeros_like(theta)
+            ones = jnp.ones_like(theta)
+            return jnp.stack(
+                [
+                    jnp.stack([cos_theta, -sin_theta, zeros], axis=1),
+                    jnp.stack([sin_theta, cos_theta, zeros], axis=1),
+                    jnp.stack([zeros, zeros, ones], axis=1),
+                ],
+                axis=1,
+            )
+        raise ValueError(
+            "Unsupported pose format for material-frame extraction: expected "
+            "SE(2) (N, 3) or (N, 3, 3), or SE(3) (N, 4, 4), "
+            f"got shape {poses.shape}"
+        )
 
     @abstractmethod
     def render_frame(self, q: Array) -> np.ndarray:
@@ -532,6 +1508,9 @@ class BaseSoftRobotRenderer(ABC):
         legend_segment = per_robot_segment[0]
         legend_point = per_robot_point[0]
 
+        if cfg.robot_override is not None:
+            for values in (per_robot_point, per_robot_segment, robot_colors_rgba):
+                values[..., :3] = cfg.robot_override
         resolved = ResolvedBackboneColors(
             per_robot_point_rgba=per_robot_point,
             per_robot_segment_rgba=per_robot_segment,
@@ -579,8 +1558,8 @@ class BaseSoftRobotRenderer(ABC):
     ) -> Array:
         """Compute backbone curves for multiple robots with base offsets.
 
-        Uses forward_kinematics_batched if available (optimized), otherwise
-        falls back to jax.vmap over compute_backbone_curve.
+        Vectorizes :meth:`compute_backbone_curve` over configurations. Each
+        curve uses the robot's public abscissa-batched kinematics method.
 
         Args:
             q_batch: Configurations of shape (N, DOF) - batch-first
@@ -590,36 +1569,42 @@ class BaseSoftRobotRenderer(ABC):
             Array of shape (N, num_points, dim) - batch-first
         """
         q_batch = jnp.asarray(q_batch)
-        base_offsets = jnp.asarray(base_offsets)
-
         if q_batch.ndim != 2:
             raise ValueError(
                 f"q_batch must have shape (N, DOF), got {q_batch.shape} with ndim={q_batch.ndim}"
             )
-        if base_offsets.ndim != 2:
-            raise ValueError(
-                f"base_offsets must have shape (N, dim), got {base_offsets.shape}"
-            )
-        if base_offsets.shape[0] != q_batch.shape[0]:
-            raise ValueError(
-                f"base_offsets first dimension ({base_offsets.shape[0]}) must "
-                f"match batch size ({q_batch.shape[0]})"
-            )
 
         # vmap over the configurations
         curves = jax.vmap(self.compute_backbone_curve)(q_batch)  # (N, num_points, dim)
-
-        # Match base offset dimensionality to curve dimensionality (2D vs 3D)
-        if base_offsets.shape[1] == curves.shape[-1]:
-            offsets = base_offsets
-        elif base_offsets.shape[1] + 1 == curves.shape[-1]:
-            pad = jnp.zeros((base_offsets.shape[0], 1), dtype=curves.dtype)
-            offsets = jnp.concatenate([base_offsets, pad], axis=1)
-        else:
-            raise ValueError(
-                f"base_offsets must have shape (N, {curves.shape[-1]}) or "
-                f"(N, {curves.shape[-1] - 1}), got {base_offsets.shape}"
-            )
+        offsets = self._normalize_base_offsets(
+            base_offsets,
+            num_robots=int(q_batch.shape[0]),
+            target_dim=int(curves.shape[-1]),
+        )
 
         # Add base offsets: (N, num_points, dim) + (N, 1, dim)
         return curves + offsets[:, None, :]
+
+    def compute_backbone_curves_and_frames_batched(
+        self, q_batch: Array, base_offsets: Array
+    ) -> tuple[Array, Array]:
+        """Compute 3D backbone positions and material frames for multiple robots.
+
+        The frame columns are the local material-frame axes in world coordinates.
+        Positional base offsets translate the curves without rotating the frames.
+        """
+        q_batch = jnp.asarray(q_batch)
+        if q_batch.ndim != 2:
+            raise ValueError(
+                f"q_batch must have shape (N, DOF), got {q_batch.shape} with ndim={q_batch.ndim}"
+            )
+
+        poses = jax.vmap(self.compute_backbone_poses)(q_batch)
+        curves = jax.vmap(self._extract_positions_3d)(poses)
+        frames = jax.vmap(self._extract_material_frames_3d)(poses)
+        offsets = self._normalize_base_offsets(
+            base_offsets,
+            num_robots=int(q_batch.shape[0]),
+            target_dim=3,
+        )
+        return curves + offsets[:, None, :], frames

@@ -1,5 +1,7 @@
+import argparse
 import time
 from functools import partial
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -7,85 +9,91 @@ import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 from diffrax import Tsit5
 
+from soromox.actuation import (
+    ThreadlikeActuator,
+    ThreadlikeImpedance,
+    ThreadlikeRouting,
+)
 from soromox.rendering import (
+    ActuatorStyleConfig,
     MatplotlibRenderer,
     Open3DRenderer,
     RendererColorConfig,
     ViserRenderer,
 )
-from soromox.systems import SystemState, TendonActuatedPCS
+from soromox.rendering.config import (
+    GeometryConfig,
+    GroundPlaneConfig,
+    RendererConfig,
+    SceneConfig,
+)
+from soromox.systems import (
+    PCS,
+    LinkSpec,
+    SystemState,
+)
+from soromox.utils.geometry import poses
 
 jax.config.update("jax_enable_x64", True)  # double precision
 
 jnp.set_printoptions(precision=4, suppress=True)
 
+DEFAULT_VIDEO_PATH = (
+    Path(__file__).resolve().parent / "videos" / "simulate_tendon_actuated_pcs.mp4"
+)
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Simulate a tendon-actuated PCS robot."
+    )
+    parser.add_argument("--video-output", type=Path, default=DEFAULT_VIDEO_PATH)
+    args = parser.parse_args()
     num_segments = 2
     rho = 1070 * jnp.ones(
         (num_segments,)
     )  # Volumetric density of Dragon Skin 20 [kg/m^3]
-    params = {
-        "p0": jnp.array(
-            [jnp.pi / 2, jnp.pi / 2, 0.0, 0.0, 0.0, 0.0]
-        ),  # Initial position and orientation
-        "L": 1e-1 * jnp.ones((num_segments,)),  # default: 1e-1
-        "r": 2e-2 * jnp.ones((num_segments,)),  # default: 2e-2
-        "rho": rho,
-        "g": jnp.array([0.0, 0.0, 9.81]),  # Gravity vector [m/s^2]
-        "E": 2e3 * jnp.ones((num_segments,)),  # Elastic modulus [Pa]
-        "G": 1e3 * jnp.ones((num_segments,)),  # Shear modulus [Pa]
-    }
-    params["D"] = 1e-3 * jnp.diag(
-        (
-            jnp.repeat(
-                jnp.array([[1e0, 1e0, 1e0, 1e3, 1e3, 1e3]]), num_segments, axis=0
+    segment_lengths = 1e-1 * jnp.ones((num_segments,))
+    material_damping_coefficient = 362.0
+    body_params = PCS.params_from_links(
+        [
+            LinkSpec.circular(
+                length=float(segment_lengths[index]),
+                radius=2e-2,
+                density=float(rho[index]),
+                young_modulus=2e3,
+                shear_modulus=1e3,
+                material_damping_coefficient=material_damping_coefficient,
+                reference_strain=[0, 0, 0, 1, 0, 0],
             )
-            * params["L"][:, None]
-        ).flatten()
+            for index in range(num_segments)
+        ],
+        gravity=jnp.array([0.0, 0.0, -9.81]),
     )
-    active_tendon_routing_params = {
-        "ry": 2e-2
-        * jnp.array(
-            [1.0, -1.0]
-        ),  # y-coordinate of the pulling point of the tendons [m]
-        "rz": 2e-2
-        * jnp.array([0.0, 0.0]),  # z-coordinate of the pulling point of the tendons [m]
-        "my": jnp.array(
-            [0.0, 0.0]
-        ),  # slope coefficient in the x-y plane of the tendons [-]
-        "mz": jnp.array(
-            [0.0, 0.0]
-        ),  # slope coefficient in the x-z plane of the tendons [-]
-        "idx_seg_att": jnp.array(
-            [1, 0]
-        ),  # length of the tendons = x-coordinate of the attachment points [m]
-    }
-    passive_tendon_routing_params = {
-        "ry": 2e-2
-        * jnp.array([0.0]),  # y-coordinate of the pulling point of the tendons [m]
-        "rz": 2e-2
-        * jnp.array([1.0]),  # z-coordinate of the pulling point of the tendons [m]
-        "my": jnp.array([0.0]),  # slope coefficient in the x-y plane of the tendons [-]
-        "mz": jnp.array([0.0]),  # slope coefficient in the x-z plane of the tendons [-]
-        "idx_seg_att": jnp.array(
-            [1]
-        ),  # length of the tendons = x-coordinate of the attachment points [m]
-    }
-    passive_tendon_params = {
-        "k_pt": jnp.array([0.6]),
-        "d_pt": jnp.array([0.1]),
-        "l_pt0": jnp.array([-0.3]),
-    }
+    active_tendon_routing = ThreadlikeRouting.linear(
+        intercept=2e-2 * jnp.array([[0.0, 1.0, 0.0], [0.0, -1.0, 0.0]]),
+        start_segment_index=0,
+        end_segment_index=(1, 0),
+    )
+    passive_tendon_routing = ThreadlikeRouting.linear(
+        intercept=2e-2 * jnp.array([0.0, 0.0, 1.0]),
+        start_segment_index=0,
+        end_segment_index=(1,),
+    )
+    passive_tendon = ThreadlikeImpedance(
+        routing=passive_tendon_routing,
+        stiffness=jnp.array([0.6]),
+        damping=jnp.array([0.1]),
+        rest_length=jnp.array([jnp.sum(segment_lengths) - 0.3]),
+    )
 
     # ======================================================
     # Robot initialization
     # ======================================================
-    robot = TendonActuatedPCS(
-        num_segments=num_segments,
-        params=params,
-        active_tendon_routing_params=active_tendon_routing_params,
-        passive_tendon_routing_params=passive_tendon_routing_params,
-        passive_tendon_params=passive_tendon_params,
+    robot = PCS(
+        params=body_params,
+        base_pose=poses.spatial_mounting_pose("hanging"),
+        actuators=ThreadlikeActuator.tendons(active_tendon_routing),
+        passive_elements=(passive_tendon,),
     )
 
     # =====================================================
@@ -103,7 +111,7 @@ if __name__ == "__main__":
     qd0 = jnp.zeros_like(q0)
 
     # Actuation parameters
-    u = jnp.array([-0.5, -1.0])
+    u = jnp.array([0.5, 1.0])
     print("u =\n", u)
 
     # Actuation matrix
@@ -112,27 +120,27 @@ if __name__ == "__main__":
     print(A)
 
     # Coupling matrix of the passive tendons
-    P = robot.jacobian_passive_tendon(q0).T
+    P = jax.jacrev(lambda q: passive_tendon.path_lengths(robot, q))(q0)
     print("P =\n", P.shape)
     print(P)
 
     # Active tendon lengths
-    la = robot.active_tendon_length(q0)
+    la = robot.actuators[0].path_lengths(robot, q0)
     print("la =\n", la.shape)
     print(la)
 
     # Passive tendon lengths
-    lp = robot.passive_tendon_length(q0)
+    lp = passive_tendon.path_lengths(robot, q0)
     print("lp =\n", lp.shape)
     print(lp)
 
     # Active tendons' position
-    ta_s = robot.forward_kinematics_active_tendons(q0, robot.L_cum[-1])
+    ta_s = robot.actuators[0].path_poses(robot, q0, robot.L_cum[-1])
     print("ta_s =\n", ta_s.shape)
     print(ta_s)
 
     # Passive tendons' position
-    tp_s = robot.forward_kinematics_passive_tendons(q0, robot.L_cum[-1])
+    tp_s = passive_tendon.path_poses(robot, q0, robot.L_cum[-1])
     print("tp_s =\n", tp_s.shape)
     print(tp_s)
 
@@ -220,20 +228,35 @@ if __name__ == "__main__":
     # animate using the MatplotlibRenderer
     matplotlib_renderer = MatplotlibRenderer(
         robot,
-        num_points=60,
-        line_width=2.5,
-        tendon_line_width=2.0,
-        color_config=RendererColorConfig(tendon_color=(0.9, 0.1, 0.1)),
+        config=RendererConfig(
+            geometry=GeometryConfig(
+                num_points=60, line_width=2.5, actuator_line_width=2.0
+            ),
+            colors=RendererColorConfig(
+                actuators=ActuatorStyleConfig(default_color=(0.9, 0.1, 0.1))
+            ),
+        ),
     )
     # q_ts is (T, DOF); animate in slider mode for quick inspection
     matplotlib_renderer.animate(
-        ts=ts, q_ts=q_ts, mode="slider", show=True, render_tendons=True
+        ts=ts, q_ts=q_ts, mode="slider", show=True, render_actuators=True
     )
 
     # render using the Open3DRenderer
-    renderer = Open3DRenderer(robot)
+    renderer = Open3DRenderer(
+        robot,
+        config=RendererConfig(
+            scene=SceneConfig.technical(
+                ground=GroundPlaneConfig(
+                    surface=False, height_reference="base_mounting_face"
+                )
+            )
+        ),
+    )
     renderer.render_sequence(
-        ts=ts, q_ts=q_ts, record_path="videos/tendon_actuated_pcs.mp4"
+        ts=ts,
+        q_ts=q_ts,
+        record_path=str(args.video_output),
     )
 
     # =====================================================
@@ -242,7 +265,17 @@ if __name__ == "__main__":
     # ViserRenderer provides interactive 3D visualization in the browser
     # with GUI controls for playback, speed, and looping.
     # Plotly plots are automatically added to the GUI at the end of the sidebar
-    viser_renderer = ViserRenderer(robot, num_points=50, backbone_style="discrete")
+    viser_renderer = ViserRenderer(
+        robot,
+        config=RendererConfig(
+            geometry=GeometryConfig(num_points=50),
+            scene=SceneConfig.technical(
+                ground=GroundPlaneConfig(
+                    surface=False, height_reference="base_mounting_face"
+                )
+            ),
+        ),
+    )
 
     # Create custom strain plots for Tendon-Actuated PCS
     # Reshape to (T, num_segments, 6)
@@ -294,9 +327,9 @@ if __name__ == "__main__":
         playback_speed=1.0,
         loop=True,
         autoplay=True,
-        render_tendons=True,
+        render_actuators=True,
         plot_configurations=False,
-        plot_tendon_positions=True,
+        plot_actuator_positions=True,
         custom_plots={
             "Rotational Strains": (fig_rot, 2.0),
             "Linear Strains": (fig_lin, 2.0),

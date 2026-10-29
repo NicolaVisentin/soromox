@@ -7,6 +7,13 @@ from pathlib import Path
 
 import jax
 
+from soromox.rendering.config import (
+    GeometryConfig,
+    GroundPlaneConfig,
+    RendererConfig,
+    SceneConfig,
+)
+
 jax.config.update("jax_enable_x64", True)  # double precision
 
 import jax.numpy as jnp
@@ -19,7 +26,11 @@ from soromox.rendering import (
     ViserRenderer,
     get_color_theme,
 )
-from soromox.systems import ArticulatedSoftRobot, SystemState
+from soromox.systems import (
+    ArticulatedSoftRobot,
+    ArticulatedSoftRobotParams,
+    SystemState,
+)
 
 
 def build_robot() -> ArticulatedSoftRobot:
@@ -42,8 +53,8 @@ def build_robot() -> ArticulatedSoftRobot:
         jnp.stack([transverse_inertia, transverse_inertia, axial_inertia], axis=1)
     )
 
-    params = {
-        "joint_screws": jnp.array(
+    params = ArticulatedSoftRobotParams(
+        joint_screw=jnp.array(
             [
                 [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
                 [0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
@@ -51,17 +62,18 @@ def build_robot() -> ArticulatedSoftRobot:
                 [0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
             ]
         ),
-        "p_tip": p_tip,
-        "p_com": p_com,
-        "m": masses,
-        "I_com": I_com,
-        "g": jnp.array([0.0, 0.0, -9.81]),
-        "K": jnp.diag(jnp.array([18.0, 13.0, 8.0, 4.5])),
-        "D": jnp.diag(jnp.array([1.4, 1.1, 0.75, 0.45])),
-        "q_ref_k": jnp.zeros((4,)),
-        "r": radii,
-    }
-    return ArticulatedSoftRobot(params)
+        tip_position=p_tip,
+        center_of_mass_position=p_com,
+        mass=masses,
+        center_of_mass_inertia=I_com,
+        gravity=jnp.array([0.0, 0.0, -9.81]),
+        joint_stiffness=jnp.diag(jnp.array([18.0, 13.0, 8.0, 4.5])),
+        joint_damping=jnp.diag(jnp.array([1.4, 1.1, 0.75, 0.45])),
+        joint_rest_configuration=jnp.zeros((4,)),
+        parent_to_joint_transform=jnp.broadcast_to(jnp.eye(4), (4, 4, 4)),
+        radius=radii,
+    )
+    return ArticulatedSoftRobot(params=params)
 
 
 def simulate(
@@ -105,7 +117,7 @@ def plot_results(
     p_ee_ts = end_effector_positions(robot, q_ts)
 
     plt.figure()
-    for joint_idx in range(robot.num_dofs):
+    for joint_idx in range(robot.num_internal_dofs):
         plt.plot(ts, q_ts[:, joint_idx], label=f"q{joint_idx + 1} [rad]")
     plt.xlabel("Time [s]")
     plt.ylabel("Joint configuration")
@@ -184,9 +196,10 @@ def render_robot(
     if backend in {"matplotlib", "all"}:
         renderer = MatplotlibRenderer(
             robot,
-            num_points=80,
-            color_config=get_color_theme("soromox:paper"),
-            line_width=5.0,
+            config=RendererConfig(
+                geometry=GeometryConfig(num_points=80, line_width=5.0),
+                colors=get_color_theme("soromox:paper"),
+            ),
         )
         if record_path is None:
             renderer.animate(
@@ -210,16 +223,31 @@ def render_robot(
         if Open3DRenderer is None:
             print("Open3DRenderer is unavailable. Install the optional Open3D extras.")
         else:
-            renderer = Open3DRenderer(robot, num_points=80)
+            renderer = Open3DRenderer(
+                robot,
+                config=RendererConfig(
+                    geometry=GeometryConfig(num_points=80),
+                    scene=SceneConfig.technical(
+                        ground=GroundPlaneConfig(
+                            surface=False, height_reference="base_mounting_face"
+                        )
+                    ),
+                ),
+            )
+            open3d_output = record_path or (
+                Path(__file__).resolve().parent
+                / "videos"
+                / "articulated_soft_robot.mp4"
+            )
             renderer.render_sequence(
                 ts,
                 q_ts,
                 playback_speed=1.0,
-                loop=record_path is None,
-                record_path=None if record_path is None else str(record_path),
+                record_path=str(open3d_output),
                 camera_config=open3d_camera,
                 window_name="Articulated Soft Robot",
             )
+            print(f"Saved {open3d_output}")
 
     if backend in {"viser", "all"}:
         if ViserRenderer is None:
@@ -227,8 +255,14 @@ def render_robot(
         else:
             renderer = ViserRenderer(
                 robot,
-                num_points=80,
-                backbone_style="discrete",
+                config=RendererConfig(
+                    geometry=GeometryConfig(num_points=80),
+                    scene=SceneConfig.technical(
+                        ground=GroundPlaneConfig(
+                            surface=False, height_reference="base_mounting_face"
+                        )
+                    ),
+                ),
             )
             renderer.render_sequence(
                 ts,
@@ -271,6 +305,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     """Run the example."""
     args = parse_args()
+    if args.record is not None and not args.record.is_absolute():
+        args.record = Path(__file__).resolve().parent / args.record
     robot = build_robot()
     ts, q_ts, qd_ts = simulate(robot, t1=args.t1)
 

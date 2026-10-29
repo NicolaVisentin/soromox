@@ -1,18 +1,22 @@
-# Choose device (cpu or gpu)
-import os
-os.environ["JAX_PLATFORM_NAME"] = "cpu"
-
-from diffrax import Tsit5
+import argparse
 from functools import partial
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 from diffrax import Tsit5
 
+from soromox.rendering.config import (
+    GeometryConfig,
+    RendererConfig,
+    RenderOutputConfig,
+)
+
 jax.config.update("jax_enable_x64", True)  # double precision
 from soromox.rendering import MatplotlibRenderer, OpenCVPlanarRenderer
-from soromox.systems import PlanarPCS, SystemState
+from soromox.systems import LinkSpec, PlanarPCS, SystemState
+from soromox.utils.geometry import poses
 
 jnp.set_printoptions(
     threshold=jnp.inf,
@@ -20,37 +24,49 @@ jnp.set_printoptions(
     formatter={"float_kind": lambda x: "0" if x == 0 else f"{x:.2e}"},
 )
 
+DEFAULT_VIDEO_PATH = (
+    Path(__file__).resolve().parent / "videos" / "simulate_planar_pcs_opencv.mp4"
+)
+
 
 if __name__ == "__main__":
-    num_segments = 2
-    params = {
-        "th0": jnp.array(jnp.pi / 2),  # initial orientation angle [rad]
-        "L": 1e-1 * jnp.ones((num_segments,)),
-        "r": 2e-2 * jnp.ones((num_segments,)),
-        "rho": 1070 * jnp.ones((num_segments,)), # Volumetric density of Dragon Skin 20 [kg/m^3]
-        "g": jnp.array([0.0, 9.81]),  # gravity vector [m/s^2] UP!
-        "E": 2e3 * jnp.ones((num_segments,)),  # Elastic modulus [Pa]
-        "G": 1e3 * jnp.ones((num_segments,)),  # Shear modulus [Pa]
-    }
-    params["D"] = 1e-3 * jnp.diag(
-        (
-            jnp.repeat(jnp.array([[1e0, 1e3, 1e3]]), num_segments, axis=0)
-            * params["L"][:, None]
-        ).flatten()
+    parser = argparse.ArgumentParser(description="Simulate a planar PCS robot.")
+    parser.add_argument("--video-output", type=Path, default=DEFAULT_VIDEO_PATH)
+    args = parser.parse_args()
+    num_segments = 1
+    rho = 1070 * jnp.ones(
+        (num_segments,)
+    )  # Volumetric density of Dragon Skin 20 [kg/m^3]
+    segment_lengths = 1e-1 * jnp.ones((num_segments,))
+    material_damping_coefficient = 318.0
+    params = PlanarPCS.params_from_links(
+        [
+            LinkSpec.circular(
+                length=float(segment_lengths[index]),
+                radius=2e-2,
+                density=float(rho[index]),
+                young_modulus=2e3,
+                shear_modulus=1e3,
+                material_damping_coefficient=material_damping_coefficient,
+                reference_strain=[0, 1, 0],
+            )
+            for index in range(num_segments)
+        ],
+        gravity=jnp.array([0.0, -9.81]),
     )
 
     # ======================================================
     # Robot initialization
     # ======================================================
     robot = PlanarPCS(
-        num_segments=num_segments,
         params=params,
+        base_pose=poses.planar_mounting_pose("hanging"),
     )
 
-    J, Jd = robot.jacobian_and_derivative(
+    J, Jd = robot.jacobian_and_time_derivative(
         q=jnp.zeros((3 * num_segments,)),
         qd=jnp.zeros((3 * num_segments,)),
-        s=params["L"][0],
+        s=params.link.length[0],
     )
 
     # =====================================================
@@ -182,15 +198,24 @@ if __name__ == "__main__":
     # =====================================================
     # Plot the robot configuration upon time
     # =====================================================
-    renderer = MatplotlibRenderer(robot, num_points=50)
+    renderer = MatplotlibRenderer(
+        robot, config=RendererConfig(geometry=GeometryConfig(num_points=50))
+    )
     renderer.animate(ts=ts, q_ts=q_ts, interval=100, mode="slider")
 
     # =====================================================
     # OpenCV-based rendering example
     # =====================================================
     opencv_renderer = OpenCVPlanarRenderer(
-        robot, num_points=50, width=700, height=700, length_scale=3.0
+        robot,
+        length_scale=3.0,
+        config=RendererConfig(
+            geometry=GeometryConfig(num_points=50),
+            output=RenderOutputConfig(width=700, height=700),
+        ),
     )
     opencv_renderer.render_sequence(
-        ts, q_ts, record_path="videos/planar_pcs_opencv.mp4"
+        ts,
+        q_ts,
+        record_path=str(args.video_output),
     )

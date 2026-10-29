@@ -4,7 +4,9 @@ Utility modules and helper functions for SoRoMoX.
 
 ## Overview
 
-This section contains utility modules that provide supporting functionality for robot systems, including parameter management and symbolic derivation tools.
+This section contains utility modules that provide supporting functionality for
+robot systems, including parameter management, numerical conventions, geometry,
+and Lie algebra tools.
 
 ## Available Utilities
 
@@ -17,17 +19,48 @@ Parameter handling, validation, and default configurations for soft robot system
 - Conversion utilities between parameter representations
 - Factory functions for common robot configurations
 
-### [Symbolic Derivation](symbolic-derivation.md)
+### [Numerics](numerics.md)
 
-Symbolic mathematics and derivation utilities using SymPy for soft robot modeling.
+Finite singular-point conventions for common JAX numerical operations.
 
-- Symbolic derivation of kinematics and dynamics
-- Code generation from symbolic expressions
-- Verification of mathematical correctness
-- Reference implementations for new robot types
+- Safe square root, Euclidean norm, division, and normalization
+- Defined values and derivatives at removable or model singularities
+- Strict-singularity diagnostics for locating invalid configurations
+
+### [Geometry](geometry.md)
+
+Pose encodings, rotation representation conversions, and geometric errors.
+
+- Direct pose-coordinate transform helpers
+- Quaternion, rotation-vector, rotation-matrix, and 6D conversions
+- Geodesic orientation errors for control and tracking
+
+### [Lie Algebra](lie-algebra.md)
+
+Explicit namespaces for rigid-body Lie groups and algebras.
+
+- Pure ``SO(2)`` / ``so(2)``, ``SO(3)`` / ``so(3)``, ``SE(2)`` / ``se(2)``,
+  and ``SE(3)`` / ``se(3)`` maps
+- Reusable stable scalar Jacobian coefficients
+
+### [Constant Strain](constant-strain.md)
+
+Rod-segment operators organized into planar and spatial namespaces.
+
+- Constant-strain adjoint, inverse-adjoint, tangent, and tangent derivative
+- Bundled evaluation when several related operators are needed
+- Separate planar and spatial operator namespaces
+
+### [Numerical Jacobian](numerical-jacobian.md)
+
+Finite-difference gradients and Jacobians for scalar- and vector-valued
+functions, including bound-aware one-sided schemes.
 
 ## Quick Links
 
 - [Parameters API Reference](parameters.md) - Parameter management utilities
-- [Symbolic Derivation API Reference](symbolic-derivation.md) - Symbolic math tools
-
+- [Numerics API Reference](numerics.md) - Safe numerical primitives
+- [Geometry API Reference](geometry.md) - Pose, rotation, and error utilities
+- [Lie Algebra API Reference](lie-algebra.md) - Lie group and Jacobian utilities
+- [Constant-Strain API Reference](constant-strain.md) - Rod-segment Lie operators
+- [Numerical Jacobian API Reference](numerical-jacobian.md) - Finite-difference gradients and Jacobians

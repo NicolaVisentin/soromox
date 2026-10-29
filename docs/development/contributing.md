@@ -2,6 +2,10 @@
 
 Thank you for your interest in contributing to Soft Robot Models in jaX (SoRoMoX)! This guide will help you get started.
 
+This page is the canonical contributor workflow. The top-level
+[`CONTRIBUTING.md`](https://github.com/tud-phi/soromox/blob/main/CONTRIBUTING.md)
+is a compact entry point for repository visitors.
+
 ## Development Setup
 
 ### 1. Fork and Clone
@@ -16,6 +20,16 @@ cd soromox
 ```bash
 pip install -e ".[dev,docs,examples]"
 ```
+
+With uv, create the project environment from the lock file:
+
+```bash
+uv sync --extra dev --extra docs --extra examples
+```
+
+Add task-specific extras when needed: `rendering` for all visualization
+backends, `rl` for reinforcement-learning workflows, and `paper_results` for
+the complete paper reproduction environment.
 
 ### 3. Set Up Pre-commit Hooks
 
@@ -41,6 +55,9 @@ Follow our coding standards:
 
 ### 3. Run Tests
 
+Paper figure tests decode committed videos and require the `ffmpeg` executable
+on `PATH` (for example, `sudo apt-get install ffmpeg` on Ubuntu).
+
 ```bash
 # Run all tests
 pytest
@@ -50,6 +67,14 @@ pytest tests/test_planar_pcs_num.py
 
 # Run with coverage
 pytest --cov=soromox
+```
+
+To use the repository's Coverage.py configuration and produce the same report
+formats as the project tooling:
+
+```bash
+uv run --extra test make coverage
+uv run --extra test make coverage_xml
 ```
 
 ### 4. Format and Lint Code
@@ -103,7 +128,7 @@ After installing the Ruff extension, your code will be automatically formatted a
 
 Ruff is configured in `pyproject.toml` with the following key settings:
 - Line length: 88 characters
-- Target Python version: 3.10+
+- Target Python version: 3.11+
 - Enabled lint rules: pycodestyle, Pyflakes, isort, flake8-bugbear, and more
 - Quote style: double quotes
 - Import organization: first-party imports from `soromox`
@@ -112,13 +137,23 @@ For more details, see the `[tool.ruff]` section in `pyproject.toml`.
 
 ### 5. Build Documentation
 
+The documentation site uses Zensical. Use its CLI for both local preview and
+production builds:
+
 ```bash
+# Fetch the documentation videos and GIFs stored in Git LFS
+git lfs pull --include="docs/assets/**" --exclude=""
+
 # Serve documentation locally
 uv run --extra docs zensical serve
 
 # Build documentation
 uv run --extra docs zensical build --clean
 ```
+
+For browser playback, encode documentation MP4s as H.264 with `yuv420p`
+pixel format and `-movflags +faststart`. Keep an animated GIF link below
+each player so it remains accessible if video playback fails.
 
 ### 6. Commit Changes
 
@@ -158,15 +193,13 @@ For guidance on adding custom robot systems or renderers, see the [Extending SoR
 Use Google-style docstrings:
 
 ```python
-def forward_kinematics(params: Dict, q: Array) -> Array:
+def forward_kinematics(params: PCSParams, q: Array) -> Array:
     """
     Compute forward kinematics for the robot.
     
     Args:
-        params: Dictionary of robot parameters including:
-            - l: Segment lengths
-            - r: Segment radii  
-            - E: Young's moduli
+        params: Typed PCS parameters. Numeric fields are JAX arrays and can be
+            replaced immutably with ``params.replace(...)``.
         q: Configuration vector of shape (n_dof,)
         
     Returns:
@@ -176,7 +209,9 @@ def forward_kinematics(params: Dict, q: Array) -> Array:
         ValueError: If configuration vector has wrong dimensions
         
     Example:
-        >>> params = {"L": jnp.array([0.1]), "r": jnp.array([0.01])}
+        >>> params = params.replace(
+        ...     link=params.link.replace(length=jnp.array([0.1]))
+        ... )
         >>> q = jnp.array([0.0, 0.0, -1.0])
         >>> pos = forward_kinematics(params, q)
     """
@@ -201,9 +236,7 @@ from soromox.systems import YourSystem
 class TestYourSystem:
     def setup_method(self):
         """Set up test fixtures."""
-        self.params = {
-            # Test parameters
-        }
+        self.params = YourSystemParams(...)
     
     def test_forward_kinematics(self):
         """Test forward kinematics."""
@@ -267,5 +300,12 @@ git push origin feature/your-feature-name
 - Join discussions in pull requests
 - Check existing documentation and examples
 - Ask questions in the community
+
+## Maintainer releases
+
+Version management and publication are maintainer-only workflows. The
+[version and release guide](https://github.com/tud-phi/soromox/blob/main/VERSION_BUMP_README.md)
+documents the canonical branch and pull request process, tag automation, and
+recovery procedure.
 
 Thank you for contributing to SoRoMoX!

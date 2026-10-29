@@ -1,6 +1,6 @@
 __all__ = ["PotentialCancellationRegulator"]
 
-from typing import Any, Optional, Tuple
+from typing import Any
 
 import jax.numpy as jnp
 from jax import Array
@@ -121,9 +121,7 @@ class PotentialCancellationRegulator(PIDController):
             stacklevel=4,
         )
 
-    def model_based_term(
-        self, system_state: SystemState
-    ) -> Tuple[Array, Optional[Any]]:
+    def model_based_term(self, system_state: SystemState) -> tuple[Array, Any | None]:
         """
         Compute the model-based feedforward control term for potential cancellation.
 
@@ -144,19 +142,19 @@ class PotentialCancellationRegulator(PIDController):
         y = system_state.y
 
         # Get current configuration
-        q, _ = jnp.split(y, 2)
+        robot, q, _ = self._controller_robot_and_state(y)
 
         # Compute gravitational force at current configuration
-        tau_gravity = self.robot.gravitational_force(q)
+        tau_gravity = robot.gravitational_force(q)
 
         # Compute elastic force at current configuration
-        tau_elastic = self.robot.elastic_force(q)
+        tau_elastic = robot.elastic_force(q)
 
         # Total generalized torque for potential cancellation
         tau_model = tau_gravity + tau_elastic
 
         # Get the actuation matrix at current configuration
-        A = self.robot.actuation_matrix(q)
+        A = robot.actuation_matrix(q)
 
         # Compute actuator input using inverse (or pseudo-inverse) of actuation matrix
         # Use standard inverse if A is square, otherwise use pseudo-inverse
@@ -166,4 +164,3 @@ class PotentialCancellationRegulator(PIDController):
             u_model = jnp.linalg.pinv(A) @ tau_model
 
         return u_model, None
-

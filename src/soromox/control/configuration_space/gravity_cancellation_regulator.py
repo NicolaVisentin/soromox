@@ -1,6 +1,6 @@
 __all__ = ["GravityCancellationRegulator"]
 
-from typing import Any, Optional, Tuple
+from typing import Any
 
 import jax.numpy as jnp
 from jax import Array
@@ -104,9 +104,7 @@ class GravityCancellationRegulator(PIDController):
             stacklevel=4,
         )
 
-    def model_based_term(
-        self, system_state: SystemState
-    ) -> Tuple[Array, Optional[Any]]:
+    def model_based_term(self, system_state: SystemState) -> tuple[Array, Any | None]:
         """
         Compute the model-based feedforward control term for gravity cancellation.
 
@@ -129,23 +127,23 @@ class GravityCancellationRegulator(PIDController):
         y = system_state.y
 
         # Get current configuration
-        q, _ = jnp.split(y, 2)
+        robot, q, _ = self._controller_robot_and_state(y)
 
         # Get desired configuration at current time
         assert self.reference_trajectory.x_des_fn is not None
         q_des = self.reference_trajectory.x_des_fn(t)
 
         # Compute gravitational force at current configuration
-        tau_gravity = self.robot.gravitational_force(q)
+        tau_gravity = robot.gravitational_force(q)
 
         # Compute elastic force at desired configuration
-        tau_elastic = self.robot.elastic_force(q_des)
+        tau_elastic = robot.elastic_force(q_des)
 
         # Total generalized torque for gravity cancellation
         tau_model = tau_gravity + tau_elastic
 
         # Get the actuation matrix at current configuration
-        A = self.robot.actuation_matrix(q)
+        A = robot.actuation_matrix(q)
 
         # Compute actuator input using inverse (or pseudo-inverse) of actuation matrix
         # Use standard inverse if A is square, otherwise use pseudo-inverse
@@ -155,4 +153,3 @@ class GravityCancellationRegulator(PIDController):
             u_model = jnp.linalg.pinv(A) @ tau_model
 
         return u_model, None
-

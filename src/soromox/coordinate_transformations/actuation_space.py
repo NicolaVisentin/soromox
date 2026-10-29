@@ -19,44 +19,57 @@ class ActuationSpaceDynamics(eqx.Module):
 
     This class transforms the configuration-space dynamics of a soft robot to actuation
     space using the Jacobian of the coordinate transformation. The actuation space is
-    defined by the actuated coordinates (e.g., tendon lengths) and unactuated coordinates
-    that span the null space of the actuation matrix.
+    defined by work-conjugate actuator coordinates and unactuated coordinates
+    that complete the actuator-coordinate Jacobian.
 
-    The actuation space dynamics follow the formulation:
-        M_y @ ydd + eta_y @ yd + h_y = [tau, 0_{n-m}]
+    The actuation space dynamics follow the general formulation:
+        M_y @ ydd + eta_y @ yd + h_y = A_y @ e
+
+    with ``A_y = J_y(q)^(-T) @ A_q(q)``. For an ideal transmission this
+    reduces to ``A_y = [[I], [0]]`` and the right-hand side is ``[e, 0]``.
 
     where:
         - M_y: Actuation space inertia matrix
         - eta_y: Actuation space Coriolis/centrifugal matrix
         - h_y: Sum of actuation space forces (gravitational, elastic, damping)
-        - tau: Applied actuator forces (only on the first num_actuators coordinates)
+        - e: Work-conjugate actuator efforts
+        - A_y: Effort-to-generalized-force map in actuation coordinates
+        - J_y: Jacobian mapping configuration velocities to actuation-space
+          coordinate velocities
         - y: Actuation space coordinates = [actuated_coords, unactuated_coords]
 
     The actuated coordinates are obtained from a (generally nonlinear) map from
-    configuration space. For tendon-actuated robots, these are the tendon lengths,
-    accessed via the robot's `actuation_coordinates` method. The Jacobian of this
-    map is the transpose of the actuation matrix:
-        J_actuated = d(tendon_lengths)/dq = A_at^T
+    configuration space. They are accessed through the robot's
+    `actuator_coordinates` method. The Jacobian of this
+    map is provided explicitly by the robot:
+        J_actuated = dy_a/dq
+
+    For an ideal transmission, ``J_actuated = A_at^T``. Losses such as
+    threadlike friction can make the generalized-force map ``A_at`` differ
+    from the transpose of the purely kinematic coordinate Jacobian.
 
     The unactuated coordinates can be specified by the user or computed via basis
     expansion using QR decomposition to find a set of linearly independent coordinates.
 
     Attributes:
-        robot: The soft robot (e.g., TendonActuatedPCS, TendonActuatedPendulum) to transform.
+        robot: The complete soft-robot system supplied at construction. For a
+            floating system, this retains the runtime base coordinates.
+        fixed_base_robot: Fixed-base copy used for internal-coordinate dynamics.
+            For floating systems, controllers remount this copy at the current
+            runtime base pose. It deliberately excludes base motion and
+            floating/internal dynamic coupling.
         H_unactuated: Matrix of shape (num_dofs - num_actuators, num_dofs) that maps
             configurations to unactuated coordinates. If None, computed via basis expansion.
         n_actuated: Number of actuated coordinates (equals num_actuators).
         n_unactuated: Number of unactuated coordinates (equals num_dofs - num_actuators).
 
     Notes:
-        The new actuation matrix in actuation space is:
-            A_y = [[I_{num_actuators}], [0_{num_dofs - num_actuators, num_actuators}]]
-        where only the first num_actuators coordinates are directly actuated.
+        For ideal transmissions, the actuation matrix in actuation space is
+        ``[[I], [0]]``. Lossy transmissions are transformed explicitly and can
+        produce a different matrix.
 
-        The robot must implement an `actuation_coordinates(q)` method that returns
-        the actuated coordinates (e.g., tendon lengths) as a function of configuration q.
-        For tendon-actuated robots (TendonActuatedPendulum, TendonActuatedPCS,
-        TendonActuatedGVS), this is aliased to `active_tendon_length`.
+        The robot must implement `actuator_coordinates(q)` and return one
+        independent work coordinate per actuator channel.
 
     References:
         Pustina, P., Della Santina, C., Boyer, F., De Luca, A., & Renda, F. (2024).
@@ -74,6 +87,7 @@ class ActuationSpaceDynamics(eqx.Module):
     """
 
     robot: SoftRobot
+    fixed_base_robot: SoftRobot
     H_unactuated: Array  # (n_unactuated, num_dofs), maps q to unactuated coords
     n_actuated: int = eqx.field(static=True)
     n_unactuated: int = eqx.field(static=True)
@@ -92,10 +106,10 @@ class ActuationSpaceDynamics(eqx.Module):
 
         Args:
             robot: A soft robot implementing the SoftRobot interface.
-                Must have `num_actuators`, `num_dofs`, `actuation_matrix`, and
-                `actuation_coordinates` attributes/methods.
-                Examples include TendonActuatedPCS, TendonActuatedPendulum,
-                TendonActuatedGVS, etc.
+                Must have `num_actuators`, `num_internal_dofs`,
+                `actuation_matrix`, `actuator_coordinates`, and
+                `actuator_coordinate_jacobian`
+                attributes/methods.
             H_unactuated: Optional matrix of shape (num_dofs - num_actuators, num_dofs) that
                 maps configurations to unactuated coordinates. If None, the unactuated
                 coordinate mapping is computed via basis expansion using QR decomposition.
@@ -105,9 +119,10 @@ class ActuationSpaceDynamics(eqx.Module):
             ValueError: If the robot does not have the required attributes.
         """
         self.robot = robot
+        self.fixed_base_robot = robot._fixed_base_robot_at_pose()
 
         # Get dimensions from robot
-        num_dofs = robot.num_dofs
+        num_dofs = self.fixed_base_robot.num_internal_dofs
         num_actuators = robot.num_actuators
         n_unactuated = num_dofs - num_actuators
 
@@ -119,15 +134,24 @@ class ActuationSpaceDynamics(eqx.Module):
                 f"num_actuators ({num_actuators}) cannot exceed num_dofs ({num_dofs})"
             )
 
-        # Get the actuation matrix at a reference configuration for basis expansion
-        # A_at has shape (num_dofs, num_actuators)
+        # Use the coordinate differential, rather than a potentially lossy
+        # effort map, to complete the coordinate basis.
         q_ref = jnp.zeros(num_dofs)
-        A_at = robot.actuation_matrix(q_ref)
+        coordinate_jacobian = self.fixed_base_robot.actuator_coordinate_jacobian(q_ref)
+        rank = int(jnp.linalg.matrix_rank(coordinate_jacobian))
+        if rank != num_actuators:
+            raise ValueError(
+                "ActuationSpaceDynamics requires independent actuator coordinates "
+                f"at the reference configuration; expected rank {num_actuators}, "
+                f"got {rank}."
+            )
 
         # Compute or validate unactuated coordinate mapping
         if H_unactuated is None:
             # Compute via basis expansion using QR decomposition
-            H_unactuated = self._compute_unactuated_coordinates_mapping(A_at)
+            H_unactuated = self._compute_unactuated_coordinates_mapping(
+                coordinate_jacobian.T
+            )
         else:
             H_unactuated = jnp.asarray(H_unactuated)
             expected_shape = (n_unactuated, num_dofs)
@@ -148,7 +172,7 @@ class ActuationSpaceDynamics(eqx.Module):
         Compute the unactuated coordinate mapping via basis expansion using QR decomposition.
 
         This method finds a set of coordinates that are linearly independent from the
-        actuated coordinates (tendon lengths). The approach uses QR decomposition to
+        actuated coordinates. The approach uses QR decomposition to
         find the orthogonal complement of the column space of the actuation matrix.
 
         Args:
@@ -191,7 +215,7 @@ class ActuationSpaceDynamics(eqx.Module):
 
         For tendon-actuated robots, this returns the tendon lengths, which are a
         nonlinear function of the configuration q. The robot must implement
-        an `actuation_coordinates(q)` method.
+        an `actuator_coordinates(q)` method.
 
         Args:
             q: Generalized coordinates of shape (num_dofs,).
@@ -199,7 +223,7 @@ class ActuationSpaceDynamics(eqx.Module):
         Returns:
             y_a: Actuated coordinates of shape (n_actuated,).
         """
-        return self.robot.actuated_coordinates(q)  # type: ignore[attr-defined]
+        return self.fixed_base_robot.actuator_coordinates(q)
 
     @eqx.filter_jit
     def unactuated_coordinates(self, q: Array) -> Array:
@@ -246,10 +270,9 @@ class ActuationSpaceDynamics(eqx.Module):
         """
         Compute the Jacobian of the map from configuration space to actuated coordinates.
 
-        For tendon-actuated robots, this is the transpose of the actuation matrix:
-            J_actuated = A_at^T = d(actuated_coordinates)/dq
-
-        where the actuation matrix A_at maps tendon forces to generalized forces.
+        This is the purely kinematic differential
+        ``d(actuated_coordinates)/dq``. It remains independent of losses in the
+        effort-to-generalized-force map.
 
         Args:
             q: Generalized coordinates of shape (num_dofs,).
@@ -257,8 +280,7 @@ class ActuationSpaceDynamics(eqx.Module):
         Returns:
             J_a: Jacobian of shape (n_actuated, num_dofs).
         """
-        A_at = self.robot.actuation_matrix(q)
-        return A_at.T
+        return self.fixed_base_robot.actuator_coordinate_jacobian(q)
 
     @eqx.filter_jit
     def jacobian_unactuated(self, q: Array) -> Array:
@@ -282,13 +304,14 @@ class ActuationSpaceDynamics(eqx.Module):
         Compute the full Jacobian from configuration space to actuation space.
 
         The Jacobian is constructed by stacking the actuated and unactuated Jacobians:
-            J = [[J_actuated], [J_unactuated]]
+            J_y = [[J_actuated], [J_unactuated]]
 
         Args:
             q: Generalized coordinates of shape (num_dofs,).
 
         Returns:
-            J: Full Jacobian of shape (num_dofs, num_dofs).
+            J_y: Full actuation-space coordinate Jacobian of shape
+                (num_dofs, num_dofs).
         """
         J_actuated = self.jacobian_actuated(q)
         J_unactuated = self.jacobian_unactuated(q)
@@ -328,7 +351,7 @@ class ActuationSpaceDynamics(eqx.Module):
             J_bar: Dynamically-consistent pseudo-inverse of shape (num_dofs, num_dofs).
         """
         J = self.jacobian(q)
-        M = self.robot.inertia_matrix(q)
+        M = self.fixed_base_robot.inertia_matrix(q)
         M_inv = jnp.linalg.inv(M)
 
         # For square J: Lambda = (J @ M^{-1} @ J^T)^{-1}
@@ -350,10 +373,10 @@ class ActuationSpaceDynamics(eqx.Module):
         Compute the actuation space inertia matrix.
 
         The actuation space inertia matrix is defined as:
-            M_y = J^{-T} @ M @ J^{-1}
+            M_y = J_y^{-T} @ M @ J_y^{-1}
 
-        where M is the configuration space inertia matrix and J is the Jacobian
-        from configuration to actuation space.
+        where M is the configuration space inertia matrix and J_y is the
+        Jacobian from configuration to actuation space.
 
         Args:
             q: Generalized coordinates of shape (num_dofs,).
@@ -362,7 +385,7 @@ class ActuationSpaceDynamics(eqx.Module):
             M_y: Actuation space inertia matrix of shape (num_dofs, num_dofs).
         """
         J_inv = self.jacobian_inverse(q)
-        M = self.robot.inertia_matrix(q)
+        M = self.fixed_base_robot.inertia_matrix(q)
 
         # M_y = J^{-T} @ M @ J^{-1}
         M_y = J_inv.T @ M @ J_inv
@@ -375,11 +398,11 @@ class ActuationSpaceDynamics(eqx.Module):
         Compute the actuation space Coriolis/centrifugal matrix.
 
         The actuation space Coriolis matrix is defined as:
-            eta_y = M_y @ (J @ M^{-1} @ C) @ J^{-1}
+            eta_y = M_y @ (J_y @ M^{-1} @ C) @ J_y^{-1}
 
         where:
             - M_y is the actuation space inertia matrix
-            - J is the Jacobian from configuration to actuation space
+            - J_y is the Jacobian from configuration to actuation space
             - M is the configuration space inertia matrix
             - C is the configuration space Coriolis matrix
 
@@ -392,9 +415,9 @@ class ActuationSpaceDynamics(eqx.Module):
         """
         J = self.jacobian(q)
         J_inv = jnp.linalg.inv(J)
-        M = self.robot.inertia_matrix(q)
+        M = self.fixed_base_robot.inertia_matrix(q)
         M_inv = jnp.linalg.inv(M)
-        C = self.robot.coriolis_matrix(q, qd)
+        C = self.fixed_base_robot.coriolis_matrix(q, qd)
 
         # Actuation space inertia
         M_y = J_inv.T @ M @ J_inv
@@ -403,96 +426,6 @@ class ActuationSpaceDynamics(eqx.Module):
         eta_y = M_y @ (J @ M_inv @ C) @ J_inv
 
         return eta_y
-
-    @eqx.filter_jit
-    def damping_matrix(self, q: Array) -> Array:
-        """
-        Compute the actuation space damping matrix.
-
-        The actuation space damping matrix is defined as:
-            D_y = J^{-T} @ D @ J^{-1}
-
-        where D is the configuration space damping matrix.
-
-        Args:
-            q: Generalized coordinates of shape (num_dofs,).
-
-        Returns:
-            D_y: Actuation space damping matrix of shape (num_dofs, num_dofs).
-        """
-        J_inv = self.jacobian_inverse(q)
-        D = self.robot.damping_matrix(q)
-
-        # D_y = J^{-T} @ D @ J^{-1}
-        D_y = J_inv.T @ D @ J_inv
-
-        return D_y
-
-    # =========================================================================
-    # Forces in actuation space
-    # =========================================================================
-
-    @eqx.filter_jit
-    def elastic_force(self, q: Array) -> Array:
-        """
-        Compute the actuation space elastic force.
-
-        The actuation space elastic force is defined as:
-            tau_el_y = J^{-T} @ tau_el
-
-        where tau_el is the configuration space elastic force.
-
-        Args:
-            q: Generalized coordinates of shape (num_dofs,).
-
-        Returns:
-            tau_el_y: Actuation space elastic force of shape (num_dofs,).
-        """
-        J_inv = self.jacobian_inverse(q)
-        tau_el = self.robot.elastic_force(q)
-
-        return J_inv.T @ tau_el
-
-    @eqx.filter_jit
-    def gravitational_force(self, q: Array) -> Array:
-        """
-        Compute the actuation space gravitational force.
-
-        The actuation space gravitational force is defined as:
-            G_y = J^{-T} @ G
-
-        where G is the configuration space gravitational force.
-
-        Args:
-            q: Generalized coordinates of shape (num_dofs,).
-
-        Returns:
-            G_y: Actuation space gravitational force of shape (num_dofs,).
-        """
-        J_inv = self.jacobian_inverse(q)
-        G = self.robot.gravitational_force(q)
-
-        return J_inv.T @ G
-
-    @eqx.filter_jit
-    def damping_force(self, q: Array, qd: Array) -> Array:
-        """
-        Compute the actuation space damping force.
-
-        The actuation space damping force is defined as:
-            tau_d_y = D_y @ yd = J^{-T} @ D @ qd
-
-        Args:
-            q: Generalized coordinates of shape (num_dofs,).
-            qd: Generalized velocities of shape (num_dofs,).
-
-        Returns:
-            tau_d_y: Actuation space damping force of shape (num_dofs,).
-        """
-        J_inv = self.jacobian_inverse(q)
-        D = self.robot.damping_matrix(q)
-
-        return J_inv.T @ D @ qd
 
     @eqx.filter_jit
     def coriolis_force(self, q: Array, qd: Array) -> Array:
@@ -515,6 +448,142 @@ class ActuationSpaceDynamics(eqx.Module):
 
         return eta_y @ yd
 
+    @eqx.filter_jit
+    def damping_matrix(self, q: Array) -> Array:
+        """
+        Compute the actuation space damping matrix.
+
+        The actuation space damping matrix is defined as:
+            D_y = J_y^{-T} @ D @ J_y^{-1}
+
+        where D is the configuration space damping matrix.
+
+        Args:
+            q: Generalized coordinates of shape (num_dofs,).
+
+        Returns:
+            D_y: Actuation space damping matrix of shape (num_dofs, num_dofs).
+        """
+        J_inv = self.jacobian_inverse(q)
+        D = self.fixed_base_robot.damping_matrix(q)
+
+        # D_y = J^{-T} @ D @ J^{-1}
+        D_y = J_inv.T @ D @ J_inv
+
+        return D_y
+
+    # =========================================================================
+    # Forces in actuation space
+    # =========================================================================
+
+    @eqx.filter_jit
+    def damping_force(self, q: Array, qd: Array) -> Array:
+        """
+        Compute the actuation space damping force.
+
+        The actuation space damping force is defined as:
+            tau_d_y = D_y @ yd = J_y^{-T} @ D @ qd
+
+        Args:
+            q: Generalized coordinates of shape (num_dofs,).
+            qd: Generalized velocities of shape (num_dofs,).
+
+        Returns:
+            tau_d_y: Actuation space damping force of shape (num_dofs,).
+        """
+        J_inv = self.jacobian_inverse(q)
+        D = self.fixed_base_robot.damping_matrix(q)
+
+        return J_inv.T @ D @ qd
+
+    @eqx.filter_jit
+    def elastic_force(self, q: Array) -> Array:
+        """
+        Compute the actuation space elastic force.
+
+        The actuation space elastic force is defined as:
+            tau_el_y = J_y^{-T} @ tau_el
+
+        where tau_el is the configuration space elastic force.
+
+        Args:
+            q: Generalized coordinates of shape (num_dofs,).
+
+        Returns:
+            tau_el_y: Actuation space elastic force of shape (num_dofs,).
+        """
+        J_inv = self.jacobian_inverse(q)
+        tau_el = self.fixed_base_robot.elastic_force(q)
+
+        return J_inv.T @ tau_el
+
+    @eqx.filter_jit
+    def gravitational_force(self, q: Array) -> Array:
+        """
+        Compute the actuation space gravitational force.
+
+        The actuation space gravitational force is defined as:
+            G_y = J_y^{-T} @ G
+
+        where G is the configuration space gravitational force.
+
+        Args:
+            q: Generalized coordinates of shape (num_dofs,).
+
+        Returns:
+            G_y: Actuation space gravitational force of shape (num_dofs,).
+        """
+        J_inv = self.jacobian_inverse(q)
+        G = self.fixed_base_robot.gravitational_force(q)
+
+        return J_inv.T @ G
+
+    @eqx.filter_jit
+    def potential_force(self, q: Array) -> Array:
+        """
+        Compute the total conservative actuation space force.
+
+        This is the sum of gravitational and elastic forces.
+
+        Args:
+            q: Generalized coordinates of shape (num_dofs,).
+
+        Returns:
+            tau_pot_y: Conservative actuation space force of shape (num_dofs,).
+        """
+        return self.gravitational_force(q) + self.elastic_force(q)
+
+    @eqx.filter_jit
+    def dynamics_terms(self, q: Array, qd: Array) -> tuple[Array, Array, Array]:
+        """
+        Return actuation-space dynamics terms ``(M_y, Cyd, G_y)``.
+
+        ``Cyd`` is the actuation-space Coriolis/centrifugal force vector.
+        ``G_y`` is the actuation-space gravitational force, matching the
+        ``SoftRobot.dynamics_terms`` convention of returning gravity separately
+        from elastic forces.
+
+        Args:
+            q: Generalized coordinates of shape (num_dofs,).
+            qd: Generalized velocities of shape (num_dofs,).
+
+        Returns:
+            M_y: Actuation space inertia matrix of shape (num_dofs, num_dofs).
+            Cyd: Actuation space Coriolis/centrifugal force of shape (num_dofs,).
+            G_y: Actuation space gravitational force of shape (num_dofs,).
+        """
+        J_inv = self.jacobian_inverse(q)
+        J_inv_T = J_inv.T
+        M, Cqd, G = self.fixed_base_robot.dynamics_terms(q, qd)
+
+        # For yd = J @ qd, the existing actuation-space Coriolis definition
+        # contracts to J^{-T} @ (C @ qd). Reusing the robot's contracted term
+        # avoids materializing C and recomputing M, J, and their inverses.
+        M_y = J_inv_T @ M @ J_inv
+        Cyd = J_inv_T @ Cqd
+        G_y = J_inv_T @ G
+        return M_y, Cyd, G_y
+
     # =========================================================================
     # Actuation matrix in actuation space
     # =========================================================================
@@ -524,12 +593,10 @@ class ActuationSpaceDynamics(eqx.Module):
         """
         Compute the actuation matrix in actuation space.
 
-        In actuation space, the actuation matrix has a special structure:
-            A_y = [[I_{num_actuators}], [0_{n_unactuated, num_actuators}]]
-
-        This means that actuator forces directly affect only the first num_actuators
-        coordinates (the actuated ones), while the unactuated coordinates receive
-        no direct actuation input.
+        The generalized-force covector transforms as
+        ``A_y = J_y(q)^(-T) @ A_q(q)``. This reduces to ``[[I], [0]]`` for an
+        ideal transmission whose force map is the transpose of its coordinate
+        Jacobian, while preserving explicit losses when those maps differ.
 
         Args:
             q: Generalized coordinates of shape (num_dofs,) (unused, for API consistency).
@@ -537,18 +604,7 @@ class ActuationSpaceDynamics(eqx.Module):
         Returns:
             A_y: Actuation matrix in actuation space of shape (num_dofs, num_actuators).
         """
-        num_dofs = self.robot.num_dofs
-        num_actuators = self.robot.num_actuators
-
-        # Build the actuation matrix: [[I], [0]]
-        A_y = jnp.vstack(
-            [
-                jnp.eye(num_actuators),
-                jnp.zeros((num_dofs - num_actuators, num_actuators)),
-            ]
-        )
-
-        return A_y
+        return self.jacobian_inverse(q).T @ self.fixed_base_robot.actuation_matrix(q)
 
     # =========================================================================
     # Reference trajectory conversion
@@ -570,11 +626,11 @@ class ActuationSpaceDynamics(eqx.Module):
 
         The transformation is:
             y = [actuated_coordinates(q), unactuated_coordinates(q)]
-            yd = J(q) @ qd
-            ydd = J(q) @ qdd + Jd(q, qd) @ qd
+            yd = J_y(q) @ qd
+            ydd = J_y(q) @ qdd + Jd_y(q, qd) @ qd
 
-        where J is the Jacobian of the coordinate transformation and Jd is its
-        time derivative.
+        where J_y is the Jacobian of the coordinate transformation and Jd_y is
+        its time derivative.
 
         Args:
             reference_trajectory: Reference trajectory in configuration space,

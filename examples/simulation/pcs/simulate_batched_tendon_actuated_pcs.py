@@ -5,63 +5,93 @@ tensions to generate multiple trajectories from the same initial condition,
 and visualizes them in a grid using Matplotlib, Open3D, and Viser renderers.
 """
 
+import argparse
+from pathlib import Path
+
 import jax
+
+from soromox.rendering.config import (
+    GeometryConfig,
+    GroundPlaneConfig,
+    RendererConfig,
+    SceneConfig,
+)
 
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
+from soromox.actuation import ThreadlikeActuator, ThreadlikeRouting
 from soromox.rendering import (
+    ActuatorStyleConfig,
     BackboneColorConfig,
     MatplotlibRenderer,
     Open3DRenderer,
     RendererColorConfig,
     ViserRenderer,
 )
-from soromox.systems import SystemState, TendonActuatedPCS
+from soromox.systems import (
+    PCS,
+    LinkSpec,
+    PCSStructure,
+    SystemState,
+)
+from soromox.utils.geometry import poses
+
+DEFAULT_OPEN3D_VIDEO_PATH = (
+    Path(__file__).resolve().parent
+    / "videos"
+    / "simulate_batched_tendon_actuated_pcs_open3d.mp4"
+)
+DEFAULT_VISER_VIDEO_PATH = (
+    Path(__file__).resolve().parent
+    / "videos"
+    / "simulate_batched_tendon_actuated_pcs_viser.mp4"
+)
 
 
-def build_robot() -> TendonActuatedPCS:
+def build_robot() -> PCS:
     """Construct a simple tendon-actuated PCS robot."""
     num_segments = 2
     rho = 1070 * jnp.ones((num_segments,))
-    params = {
-        "p0": jnp.array([jnp.pi / 2, jnp.pi / 2, 0.0, 0.0, 0.0, 0.0]),
-        "L": 1e-1 * jnp.ones((num_segments,)),
-        "r": 2e-2 * jnp.ones((num_segments,)),
-        "rho": rho,
-        "g": jnp.array([0.0, 0.0, 9.81]),
-        "E": 2e3 * jnp.ones((num_segments,)),
-        "G": 1e3 * jnp.ones((num_segments,)),
-    }
-    params["D"] = 1e-3 * jnp.diag(
-        (
-            jnp.repeat(
-                jnp.array([[1e0, 1e0, 1e0, 1e3, 1e3, 1e3]]), num_segments, axis=0
+    segment_lengths = 1e-1 * jnp.ones((num_segments,))
+    material_damping_coefficient = 362.0
+    body_params = PCS.params_from_links(
+        [
+            LinkSpec.circular(
+                length=float(segment_lengths[index]),
+                radius=2e-2,
+                density=float(rho[index]),
+                young_modulus=2e3,
+                shear_modulus=1e3,
+                material_damping_coefficient=material_damping_coefficient,
+                reference_strain=[0, 0, 0, 1, 0, 0],
             )
-            * params["L"][:, None]
-        ).flatten()
+            for index in range(num_segments)
+        ],
+        gravity=jnp.array([0.0, 0.0, -9.81]),
     )
-    active_tendon_routing_params = {
-        "ry": jnp.array([2e-2, -2e-2, 1e-2, -1e-2]),
-        "rz": jnp.zeros((4,)),
-        "my": jnp.array([0.0, 0.0, 0.0, 0.0]),
-        "mz": jnp.array([0.0, 0.0, 0.0, 0.0]),
-        "idx_seg_att": jnp.array([0, 0, 1, 1]),
-    }
-
-    return TendonActuatedPCS(
-        num_segments=num_segments,
-        params=params,
-        active_tendon_routing_params=active_tendon_routing_params,
+    active_tendon_routing = ThreadlikeRouting.linear(
+        intercept=jnp.array(
+            [[0.0, 2e-2, 0.0], [0.0, -2e-2, 0.0], [0.0, 1e-2, 0.0], [0.0, -1e-2, 0.0]]
+        ),
+        start_segment_index=0,
+        end_segment_index=(0, 0, 1, 1),
     )
 
+    return PCS(
+        params=body_params,
+        base_pose=poses.spatial_mounting_pose("hanging"),
+        structure=PCSStructure(),
+        actuators=ThreadlikeActuator.tendons(active_tendon_routing),
+    )
 
-def simulate_batched(robot: TendonActuatedPCS, num_robots: int, rng_key: jax.Array):
+
+def simulate_batched(robot: PCS, num_robots: int, rng_key: jax.Array):
     """Roll out multiple trajectories with vmap and random constant tendon tensions."""
-    q0 = jnp.zeros((num_robots, robot.num_dofs))
+    q0 = jnp.zeros((num_robots, robot.num_coordinates))
     # # sample different configurations per robot in the batch
     # q0 = q0 + jax.random.uniform(
-    #     rng_key, (num_robots, robot.num_dofs), minval=-0.2, maxval=0.2
+    #     rng_key, (num_robots, robot.num_coordinates), minval=-0.2, maxval=0.2
     # )
     print("q0 batch:\n", q0)
 
@@ -70,12 +100,12 @@ def simulate_batched(robot: TendonActuatedPCS, num_robots: int, rng_key: jax.Arr
         t=jnp.zeros((num_robots,)), y=jnp.concatenate([q0, qd0], axis=1)
     )
 
-    # Sample constant tendon tensions per robot in [-1, 0]
+    # Sample positive tendon tensions per robot.
     u_batch = jax.random.uniform(
         rng_key,
         (num_robots, robot.num_actuators),
-        minval=-1.0,
-        maxval=0.0,
+        minval=0.0,
+        maxval=1.0,
     )
     print("u_batch:\n", u_batch)
 
@@ -100,7 +130,7 @@ def simulate_batched(robot: TendonActuatedPCS, num_robots: int, rng_key: jax.Arr
     return ts, q_ts
 
 
-def main():
+def main(*, open3d_video_output: Path, viser_video_output: Path):
     if Open3DRenderer is None:
         raise ImportError(
             "Open3D is required for this example. Install with `pip install open3d`."
@@ -116,13 +146,17 @@ def main():
     # animate using the MatplotlibRenderer
     matplotlib_renderer = MatplotlibRenderer(
         robot,
-        num_points=60,
-        line_width=2.5,
-        grid_spacing=grid_spacing,
-        tendon_line_width=2.0,
-        color_config=RendererColorConfig(
-            backbone=BackboneColorConfig(robot_palette="plasma"),
-            tendon_color=(0.9, 0.1, 0.1),
+        config=RendererConfig(
+            geometry=GeometryConfig(
+                num_points=60,
+                line_width=2.5,
+                grid_spacing=grid_spacing,
+                actuator_line_width=2.0,
+            ),
+            colors=RendererColorConfig(
+                backbone=BackboneColorConfig(robot_palette="plasma"),
+                actuators=ActuatorStyleConfig(default_color=(0.9, 0.1, 0.1)),
+            ),
         ),
     )
     # q_ts_batched is (N, T, DOF); animate in slider mode for quick inspection
@@ -131,15 +165,22 @@ def main():
     # render using the Open3DRenderer
     renderer = Open3DRenderer(
         robot,
-        grid_spacing=grid_spacing,
-        color_config=RendererColorConfig(
-            backbone=BackboneColorConfig(robot_palette="viridis")
+        config=RendererConfig(
+            geometry=GeometryConfig(grid_spacing=grid_spacing),
+            colors=RendererColorConfig(
+                backbone=BackboneColorConfig(robot_palette="viridis")
+            ),
+            scene=SceneConfig.technical(
+                ground=GroundPlaneConfig(
+                    surface=False, height_reference="base_mounting_face"
+                )
+            ),
         ),
     )
     renderer.render_sequence(
         ts=ts,
         q_ts=q_ts_batched,
-        record_path="videos/batched_tendon_actuated_pcs_open3d.mp4",
+        record_path=str(open3d_video_output),
     )
 
     # render using the ViserRenderer
@@ -149,9 +190,16 @@ def main():
 
     viser_renderer = ViserRenderer(
         robot,
-        grid_spacing=grid_spacing,
-        color_config=RendererColorConfig(
-            backbone=BackboneColorConfig(robot_palette="magma")
+        config=RendererConfig(
+            geometry=GeometryConfig(grid_spacing=grid_spacing),
+            colors=RendererColorConfig(
+                backbone=BackboneColorConfig(robot_palette="magma")
+            ),
+            scene=SceneConfig.technical(
+                ground=GroundPlaneConfig(
+                    surface=False, height_reference="base_mounting_face"
+                )
+            ),
         ),
     )
     viser_renderer.render_sequence(
@@ -160,10 +208,21 @@ def main():
         playback_speed=1.0,
         autoplay=True,
         loop=True,
-        render_tendons=True,
-        record_path="videos/batched_tendon_actuated_pcs_viser.mp4",
+        render_actuators=True,
+        record_path=str(viser_video_output),
     )
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--open3d-video-output", type=Path, default=DEFAULT_OPEN3D_VIDEO_PATH
+    )
+    parser.add_argument(
+        "--viser-video-output", type=Path, default=DEFAULT_VISER_VIDEO_PATH
+    )
+    args = parser.parse_args()
+    main(
+        open3d_video_output=args.open3d_video_output,
+        viser_video_output=args.viser_video_output,
+    )

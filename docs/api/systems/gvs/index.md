@@ -2,6 +2,11 @@
 
 This section covers continuum soft robots modeled with the Geometric Variable Strain (GVS) approach.
 
+GVS uses the shared continuum link, cross-section, isotropic material, and joint
+model described in [Continuum Robot Components](../continuum-components.md).
+See [Parameters, Updates, and Optimization](../../../user-guide/parameters-and-optimization.md)
+for construction, replacement, and identification workflows.
+
 ## Overview
 
 GVS systems generalize PCS by allowing arbitrary strain basis functions instead of piecewise constant assumptions. A model is assembled from `GVSSegment` entries, where each segment contains a `LinkSpec`, `JointSpec`, `StrainBasisSpec`, and `num_gauss_points`.
@@ -13,7 +18,7 @@ GVS systems generalize PCS by allowing arbitrary strain basis functions instead 
 | `GVSSegment` | Complete declaration of one GVS segment |
 | `LinkSpec` | Link geometry, material properties, and length |
 | `JointSpec` | Preceding joint type and optional joint parameters |
-| `StrainBasisSpec` | Strain basis family, active components, orders, and reference strain |
+| `StrainBasisSpec` | Strain basis family, active components, and orders |
 
 ## Basis Functions
 
@@ -45,9 +50,9 @@ GVS systems generalize PCS by allowing arbitrary strain basis functions instead 
 
 Core 3D GVS implementation for generalized continuum robots.
 
-### [Tendon Actuated GVS](tendon-actuated-gvs.md)
-
-3D GVS robots with cable-driven actuation.
+`GVS` accepts the same composable `actuators=` interface as PCS. Routed tendons,
+pushing rods, muscles, and equivalent chambers are described in the
+[threadlike actuation guide](../../actuation/threadlike.md).
 
 !!! tip "GVS vs PCS"
     Use **PCS** when piecewise constant strain is sufficient. Use **GVS** when you need flexible basis functions, segment-specific joints, or hybrid soft-rigid parametrizations.

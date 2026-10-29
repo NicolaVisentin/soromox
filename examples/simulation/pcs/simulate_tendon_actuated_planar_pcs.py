@@ -1,57 +1,72 @@
 from functools import partial
-from pathlib import Path
 
 import jax
 import matplotlib.pyplot as plt
 from diffrax import Tsit5
 from jax import numpy as jnp
 
+from soromox.rendering.config import GeometryConfig, RendererConfig
+
 jax.config.update("jax_enable_x64", True)  # double precision
+from soromox.actuation import ThreadlikeActuator, ThreadlikeRouting
 from soromox.rendering import MatplotlibRenderer
-from soromox.systems import SystemState, TendonActuatedPlanarPCS
-
-videos_dir = Path("videos")
-videos_dir.mkdir(parents=True, exist_ok=True)
-
+from soromox.systems import (
+    LinkSpec,
+    PlanarPCS,
+    PlanarPCSStructure,
+    SystemState,
+)
+from soromox.utils.geometry import poses
 
 if __name__ == "__main__":
     num_segments = 2  # number of segments in the robot
     rho = 1070 * jnp.ones(
         (num_segments,)
     )  # Volumetric density of Dragon Skin 20 [kg/m^3]
-    params = {
-        "th0": jnp.array(jnp.pi / 2),  # initial orientation angle [rad]
-        "L": 1e-1 * jnp.ones((num_segments,)),
-        "r": 2e-2 * jnp.ones((num_segments,)),
-        "rho": rho,
-        "g": 0 * jnp.array([0.0, 9.81]),  # gravitational acceleration [m/s^2] UP!
-        "E": 5e3 * jnp.ones((num_segments,)),  # Elastic modulus [Pa]
-        "G": 1e3 * jnp.ones((num_segments,)),  # Shear modulus [Pa]
-        "d": 2e-2
-        * jnp.array([[1.0, -1.0]]).repeat(
-            num_segments, axis=0
-        ),  # distance of tendons from the central axis [m]
-    }
-    params["D"] = 1e-3 * jnp.diag(
-        (
-            jnp.repeat(jnp.array([[1e0, 1e3, 1e3]]), num_segments, axis=0)
-            * params["L"][:, None]
-        ).flatten()
+    segment_lengths = 1e-1 * jnp.ones((num_segments,))
+    material_damping_coefficient = 318.0
+    body = PlanarPCS.params_from_links(
+        [
+            LinkSpec.circular(
+                length=float(segment_lengths[index]),
+                radius=2e-2,
+                density=float(rho[index]),
+                young_modulus=5e3,
+                shear_modulus=1e3,
+                material_damping_coefficient=material_damping_coefficient,
+                reference_strain=[0, 1, 0],
+            )
+            for index in range(num_segments)
+        ],
+        gravity=0 * jnp.array([0.0, 9.81]),
+    )
+    tendon_offsets = 2e-2 * jnp.array([[1.0, -1.0]]).repeat(num_segments, axis=0)
+    active_tendon_routing = ThreadlikeRouting.linear(
+        intercept=jnp.stack(
+            (
+                jnp.zeros((2 * num_segments,)),
+                tendon_offsets.reshape(-1),
+                jnp.zeros((2 * num_segments,)),
+            ),
+            axis=-1,
+        ),
+        start_segment_index=0,
+        end_segment_index=tuple(
+            int(index) for index in jnp.repeat(jnp.arange(num_segments), 2)
+        ),
     )
 
     # activate all strains (i.e. bending, shear, and axial)
     strain_selector = jnp.ones((3 * num_segments,), dtype=bool)
-    # actuation selector for the segments
-    segment_actuation_selector = jnp.ones((num_segments,), dtype=bool)
 
     # ======================================================
     # Robot initialization
     # ======================================================
-    robot = TendonActuatedPlanarPCS(
-        num_segments=num_segments,
-        params=params,
-        strain_selector=strain_selector,
-        segment_actuation_selector=segment_actuation_selector,
+    robot = PlanarPCS(
+        params=body,
+        base_pose=poses.planar_mounting_pose("upright"),
+        structure=PlanarPCSStructure(strain_selector=strain_selector),
+        actuators=ThreadlikeActuator.tendons(active_tendon_routing),
     )
 
     # =====================================================
@@ -96,7 +111,7 @@ if __name__ == "__main__":
     #     maxval=0.0,
     # )
     # alternating tendon tensions
-    base_tension = jnp.array(-0.3, dtype=q0.dtype)
+    base_tension = jnp.array(0.3, dtype=q0.dtype)
     segment_ids = jnp.arange(num_segments)
     segment_tensions = base_tension / (segment_ids.astype(q0.dtype) + 1.0)
     even_segments = (segment_ids % 2) == 0
@@ -107,11 +122,7 @@ if __name__ == "__main__":
     tendon_pattern = tendon_pattern.at[:, 1].set(
         jnp.where(~even_segments, segment_tensions, 0.0)
     )
-    u = jnp.take(
-        tendon_pattern,
-        robot.segment_indices_to_actuate,
-        axis=0,
-    ).reshape(-1)
+    u = tendon_pattern.reshape(-1)
     print("u =\n", u)
 
     # call the actuation mapping function
@@ -232,5 +243,7 @@ if __name__ == "__main__":
     # =====================================================
     # Plot the robot configuration upon time
     # =====================================================
-    renderer = MatplotlibRenderer(robot, num_points=50)
+    renderer = MatplotlibRenderer(
+        robot, config=RendererConfig(geometry=GeometryConfig(num_points=50))
+    )
     renderer.animate(ts=ts, q_ts=q_ts, interval=100, mode="slider")
